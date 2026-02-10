@@ -4,6 +4,7 @@ import { prisma } from "./db";
 import { activeConnections } from "./webrtc-signaling";
 import { NotFoundError, BadRequestError } from "./errors";
 import { getResetKeySequence } from "./redfish-keys";
+import { sendJsonRpc } from "./jsonrpc";
 
 // Redfish protocol version
 const REDFISH_VERSION = "1.0.0";
@@ -21,6 +22,10 @@ const ODATA = {
   CHASSIS: "#Chassis.v1_0_0.Chassis",
   SESSION_SERVICE: "#SessionService.v1_0_0.SessionService",
   SESSION_COLLECTION: "#SessionCollection.SessionCollection",
+  JETKVM_EXTENSIONS: "#JetKVMExtensions.v1_0_0.JetKVMExtensions",
+  JETKVM_ACTIVE_EXTENSION: "#JetKVMActiveExtension.v1_0_0.JetKVMActiveExtension",
+  JETKVM_DC_POWER: "#JetKVMDCPower.v1_0_0.JetKVMDCPower",
+  JETKVM_ATX_POWER: "#JetKVMATXPower.v1_0_0.JetKVMATXPower",
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -320,6 +325,19 @@ redfishRouter.get(
       VirtualMedia: {
         "@odata.id": `/redfish/v1/Managers/${device.id}/VirtualMedia`,
       },
+      Oem: {
+        JetKVM: {
+          Extensions: {
+            "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/Extensions`,
+          },
+          DCPower: {
+            "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/DCPower`,
+          },
+          ATXPower: {
+            "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/ATXPower`,
+          },
+        },
+      },
       Links: {
         ManagerForServers: [
           { "@odata.id": `/redfish/v1/Systems/${device.id}` },
@@ -443,6 +461,187 @@ redfishRouter.post(
         data: { action: "eject" },
       }),
     );
+
+    return res.status(204).send();
+  },
+);
+
+// -- OEM: JetKVM Extensions -------------------------------------------------
+// These endpoints expose the JetKVM extension system via Redfish OEM properties,
+// following the JsonRPC patterns from https://github.com/jetkvm/kvm/blob/dev/jsonrpc.go
+
+// Helper to get a connected device and its WebSocket for RPC calls
+async function getDeviceForRpc(sub: string, deviceId: string) {
+  const device = await getUserDevice(sub, deviceId);
+  if (!device) throw new NotFoundError("Manager not found");
+
+  const conn = activeConnections.get(device.id);
+  if (!conn) throw new NotFoundError("Device is not connected");
+
+  return { device, ws: conn[0] };
+}
+
+// -- Extensions overview ----------------------------------------------------
+redfishRouter.get(
+  "/v1/Managers/:id/Oem/JetKVM/Extensions",
+  redfishAuthenticated,
+  async (req: Request<{ id: string }>, res: Response) => {
+    const sub = (req as any).redfishSub as string;
+    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+
+    const activeExtension = await sendJsonRpc(ws, "getActiveExtension", {});
+
+    return res.json({
+      "@odata.type": ODATA.JETKVM_EXTENSIONS,
+      "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/Extensions`,
+      Id: "Extensions",
+      Name: "JetKVM Extensions",
+      ActiveExtension: activeExtension,
+      AvailableExtensions: ["", "atx-power", "dc-power"],
+      Active: {
+        "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/Extensions/Active`,
+      },
+      Actions: {
+        "#JetKVMExtensions.SetActiveExtension": {
+          target: `/redfish/v1/Managers/${device.id}/Oem/JetKVM/Extensions/Actions/SetActiveExtension`,
+          "extensionId@Redfish.AllowableValues": ["", "atx-power", "dc-power"],
+        },
+      },
+    });
+  },
+);
+
+// -- Active Extension details -----------------------------------------------
+redfishRouter.get(
+  "/v1/Managers/:id/Oem/JetKVM/Extensions/Active",
+  redfishAuthenticated,
+  async (req: Request<{ id: string }>, res: Response) => {
+    const sub = (req as any).redfishSub as string;
+    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+
+    const activeExtension = await sendJsonRpc(ws, "getActiveExtension", {});
+
+    return res.json({
+      "@odata.type": ODATA.JETKVM_ACTIVE_EXTENSION,
+      "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/Extensions/Active`,
+      Id: "Active",
+      Name: "Active Extension",
+      ExtensionId: activeExtension,
+    });
+  },
+);
+
+// -- Set Active Extension ---------------------------------------------------
+redfishRouter.post(
+  "/v1/Managers/:id/Oem/JetKVM/Extensions/Actions/SetActiveExtension",
+  redfishAuthenticated,
+  async (req: Request<{ id: string }>, res: Response) => {
+    const sub = (req as any).redfishSub as string;
+    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+
+    const { extensionId } = req.body as { extensionId?: string };
+    if (extensionId === undefined) throw new BadRequestError("extensionId is required");
+
+    await sendJsonRpc(ws, "setActiveExtension", { extensionId });
+
+    return res.status(204).send();
+  },
+);
+
+// -- DC Power State ---------------------------------------------------------
+redfishRouter.get(
+  "/v1/Managers/:id/Oem/JetKVM/DCPower",
+  redfishAuthenticated,
+  async (req: Request<{ id: string }>, res: Response) => {
+    const sub = (req as any).redfishSub as string;
+    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+
+    const dcState = await sendJsonRpc(ws, "getDCPowerState", {});
+
+    return res.json({
+      "@odata.type": ODATA.JETKVM_DC_POWER,
+      "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/DCPower`,
+      Id: "DCPower",
+      Name: "DC Power Control",
+      IsOn: dcState?.isOn ?? false,
+      Voltage: dcState?.voltage ?? 0,
+      Current: dcState?.current ?? 0,
+      Power: dcState?.power ?? 0,
+      RestoreState: dcState?.restoreState ?? 0,
+      Actions: {
+        "#JetKVMDCPower.SetState": {
+          target: `/redfish/v1/Managers/${device.id}/Oem/JetKVM/DCPower/Actions/SetState`,
+        },
+      },
+    });
+  },
+);
+
+// -- Set DC Power State -----------------------------------------------------
+redfishRouter.post(
+  "/v1/Managers/:id/Oem/JetKVM/DCPower/Actions/SetState",
+  redfishAuthenticated,
+  async (req: Request<{ id: string }>, res: Response) => {
+    const sub = (req as any).redfishSub as string;
+    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+
+    const { enabled } = req.body as { enabled?: boolean };
+    if (enabled === undefined) throw new BadRequestError("enabled is required");
+
+    await sendJsonRpc(ws, "setDCPowerState", { enabled });
+
+    return res.status(204).send();
+  },
+);
+
+// -- ATX Power State --------------------------------------------------------
+redfishRouter.get(
+  "/v1/Managers/:id/Oem/JetKVM/ATXPower",
+  redfishAuthenticated,
+  async (req: Request<{ id: string }>, res: Response) => {
+    const sub = (req as any).redfishSub as string;
+    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+
+    const atxState = await sendJsonRpc(ws, "getATXState", {});
+
+    return res.json({
+      "@odata.type": ODATA.JETKVM_ATX_POWER,
+      "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/ATXPower`,
+      Id: "ATXPower",
+      Name: "ATX Power Control",
+      Power: atxState?.power ?? false,
+      HDD: atxState?.hdd ?? false,
+      Actions: {
+        "#JetKVMATXPower.SetPowerAction": {
+          target: `/redfish/v1/Managers/${device.id}/Oem/JetKVM/ATXPower/Actions/SetPowerAction`,
+          "action@Redfish.AllowableValues": [
+            "power-short",
+            "power-long",
+            "reset",
+          ],
+        },
+      },
+    });
+  },
+);
+
+// -- Set ATX Power Action ---------------------------------------------------
+redfishRouter.post(
+  "/v1/Managers/:id/Oem/JetKVM/ATXPower/Actions/SetPowerAction",
+  redfishAuthenticated,
+  async (req: Request<{ id: string }>, res: Response) => {
+    const sub = (req as any).redfishSub as string;
+    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+
+    const { action } = req.body as { action?: string };
+    if (!action) throw new BadRequestError("action is required");
+
+    const allowed = ["power-short", "power-long", "reset"];
+    if (!allowed.includes(action)) {
+      throw new BadRequestError(`Unsupported action: ${action}. Allowed: ${allowed.join(", ")}`);
+    }
+
+    await sendJsonRpc(ws, "setATXPowerAction", { action });
 
     return res.status(204).send();
   },

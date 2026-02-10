@@ -92,9 +92,14 @@ vi.mock("../src/webrtc-signaling", () => ({
   activeConnections: new Map(),
 }));
 
+vi.mock("../src/jsonrpc", () => ({
+  sendJsonRpc: vi.fn(),
+}));
+
 import { redfishAuthenticated } from "../src/redfish";
 import { prisma } from "../src/db";
 import { activeConnections } from "../src/webrtc-signaling";
+import { sendJsonRpc } from "../src/jsonrpc";
 
 function createMockRequest(overrides: Partial<Request> = {}): Request {
   return {
@@ -204,5 +209,86 @@ describe("redfishAuthenticated middleware", () => {
       "WWW-Authenticate",
       'Basic realm="JetKVM Redfish Service"',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unit tests for jsonrpc.ts
+// ---------------------------------------------------------------------------
+describe("sendJsonRpc", () => {
+  let sendJsonRpcReal: typeof import("../src/jsonrpc").sendJsonRpc;
+
+  beforeEach(async () => {
+    // Dynamically import the real module (not the mock)
+    const mod = await vi.importActual<typeof import("../src/jsonrpc")>("../src/jsonrpc");
+    sendJsonRpcReal = mod.sendJsonRpc;
+  });
+
+  it("should send a JsonRPC request and resolve with the result", async () => {
+    const mockWs = {
+      on: vi.fn(),
+      off: vi.fn(),
+      send: vi.fn(),
+    };
+
+    // Simulate the device responding
+    mockWs.on.mockImplementation((event: string, handler: (data: string) => void) => {
+      if (event === "message") {
+        // Respond after send() is called, using the id from the sent message
+        setTimeout(() => {
+          const sentMsg = JSON.parse(mockWs.send.mock.calls[0][0]);
+          handler(JSON.stringify({
+            type: "jsonrpc",
+            data: { jsonrpc: "2.0", result: "dc-power", id: sentMsg.data.id },
+          }));
+        }, 5);
+      }
+    });
+
+    const result = await sendJsonRpcReal(mockWs as any, "getActiveExtension", {});
+
+    expect(result).toBe("dc-power");
+    expect(mockWs.send).toHaveBeenCalled();
+
+    // Verify the sent message format
+    const sentMsg = JSON.parse(mockWs.send.mock.calls[0][0]);
+    expect(sentMsg.type).toBe("jsonrpc");
+    expect(sentMsg.data.jsonrpc).toBe("2.0");
+    expect(sentMsg.data.method).toBe("getActiveExtension");
+  });
+
+  it("should reject on JsonRPC error response", async () => {
+    const mockWs = {
+      on: vi.fn(),
+      off: vi.fn(),
+      send: vi.fn(),
+    };
+
+    mockWs.on.mockImplementation((event: string, handler: (data: string) => void) => {
+      if (event === "message") {
+        setTimeout(() => {
+          const sentMsg = JSON.parse(mockWs.send.mock.calls[0][0]);
+          handler(JSON.stringify({
+            type: "jsonrpc",
+            data: { jsonrpc: "2.0", error: { code: -1, message: "Extension not loaded" }, id: sentMsg.data.id },
+          }));
+        }, 5);
+      }
+    });
+
+    await expect(sendJsonRpcReal(mockWs as any, "getDCPowerState", {}))
+      .rejects.toThrow("Extension not loaded");
+  });
+
+  it("should reject on timeout", async () => {
+    const mockWs = {
+      on: vi.fn(),
+      off: vi.fn(),
+      send: vi.fn(),
+    };
+
+    // Don't respond — should timeout
+    await expect(sendJsonRpcReal(mockWs as any, "getDCPowerState", {}, 50))
+      .rejects.toThrow("JsonRPC timeout");
   });
 });
