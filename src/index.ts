@@ -9,6 +9,7 @@ import * as Devices from "./devices";
 import * as OIDC from "./oidc";
 import * as Webrtc from "./webrtc";
 import * as Releases from "./releases";
+import { redfishRouter } from "./redfish";
 
 import { HttpError } from "./errors";
 import { authenticated } from "./auth";
@@ -113,6 +114,9 @@ app.get(
     return res.json({ ...user, sub });
   },
 );
+
+// Redfish compatibility layer
+app.use("/redfish", redfishRouter);
 
 app.get("/releases", Releases.Retrieve);
 app.get(
