@@ -5,17 +5,18 @@
 // Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
 model User {
-  id       BigInt         @id @default(autoincrement())
-  googleId String         @unique
+  id       Int            @id @default(autoincrement())
+  oidcId   String         @unique
   email    String?
   picture  String?
   device   Device[]
@@ -24,26 +25,26 @@ model User {
 
 model Device {
   id                 String    @unique
-  lastSeen           DateTime? @db.Timestamp(6)
+  lastSeen           DateTime?
   name               String?
   user               User      @relation(fields: [userId], references: [id])
-  userId             BigInt
+  userId             Int
   tempToken          String?
   tempTokenExpiresAt DateTime?
   secretToken        String?   @unique
 }
 
 model TurnActivity {
-  id            BigInt    @id @default(autoincrement())
+  id            Int       @id @default(autoincrement())
   user          User      @relation(fields: [userId], references: [id])
-  userId        BigInt
-  createdAt     DateTime? @default(now()) @db.Timestamp(6)
+  userId        Int
+  createdAt     DateTime? @default(now())
   bytesSent     Int
   bytesReceived Int
 }
 
 model Release {
-  id                BigInt   @id @default(autoincrement())
+  id                Int      @id @default(autoincrement())
   version           String
   rolloutPercentage Int      @default(10) // 10% of users
   createdAt         DateTime @default(now())

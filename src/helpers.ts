@@ -1,42 +1,30 @@
-
-import { createHash } from "crypto";
-import { type GetObjectCommandOutput } from "@aws-sdk/client-s3";
 import { InternalServerError } from "./errors";
 import { validRange } from "semver";
 
-// Helper function to convert stream to string
-export async function streamToString(stream: any): Promise<string> {
-  const chunks: Uint8Array[] = [];
-  
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  
-  const result = Buffer.concat(chunks).toString("utf-8");
-  return result.trimEnd();
+/**
+ * Computes SHA-256 hash of an ArrayBuffer and returns hex string.
+ */
+export async function sha256Hex(data: ArrayBuffer): Promise<string> {
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
-  
-// Helper function to convert stream to buffer
-export async function streamToBuffer(stream: any): Promise<Buffer> {
-  const chunks = [];
-  for await (const chunk of stream) {
-    chunks.push(chunk);
-  }
-  return Buffer.concat(chunks);
-} 
 
+/**
+ * Verifies that an R2 object's content matches the expected SHA-256 hash.
+ */
 export async function verifyHash(
-  file: GetObjectCommandOutput,
-  hashFile: GetObjectCommandOutput,
+  fileBody: ReadableStream | ArrayBuffer,
+  hashText: string,
   exception?: string,
 ): Promise<boolean> {
-  const content = await streamToBuffer(file.Body);
-  const remoteHash = await streamToString(hashFile.Body);
-  const localHash = createHash("sha256")
-    .update(new Uint8Array(content))
-    .digest("hex");
-
-  const matches = remoteHash.trim() === localHash;
+  const content =
+    fileBody instanceof ArrayBuffer
+      ? fileBody
+      : await new Response(fileBody).arrayBuffer();
+  const localHash = await sha256Hex(content);
+  const matches = hashText.trim() === localHash;
   if (!matches && exception) {
     throw new InternalServerError(exception);
   }
@@ -50,10 +38,25 @@ export function toSemverRange(range?: string) {
 
 /**
  * Computes a deterministic rollout bucket (0-99) for a device ID.
- * Used to decide if a device is eligible for a staged rollout.
+ * Uses SHA-256 since Web Crypto does not support MD5.
  */
-export function getDeviceRolloutBucket(deviceId: string): number {
-  const hash = createHash("md5").update(deviceId).digest("hex");
-  const hashPrefix = hash.substring(0, 8);
-  return parseInt(hashPrefix, 16) % 100;
+export async function getDeviceRolloutBucket(
+  deviceId: string,
+): Promise<number> {
+  const data = new TextEncoder().encode(deviceId);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+  const view = new DataView(hashBuffer);
+  const value = view.getUint32(0);
+  return value % 100;
+}
+
+/**
+ * Generate a random hex token of the given byte length.
+ */
+export function randomHex(bytes: number): string {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }

@@ -1,93 +1,36 @@
-import { WebSocket } from "ws";
-
-// JsonRPC 2.0 request/response types following the pattern from
-// https://github.com/jetkvm/kvm/blob/dev/jsonrpc.go
-
-interface JsonRpcRequest {
-  jsonrpc: "2.0";
-  method: string;
-  params?: Record<string, unknown>;
-  id: number;
-}
-
-interface JsonRpcResponse {
-  jsonrpc: "2.0";
-  result?: unknown;
-  error?: { code: number; message: string; data?: unknown };
-  id: number;
-}
-
-let rpcIdCounter = 0;
+import type { Env } from "./env";
 
 /**
- * Sends a JsonRPC 2.0 request to a device over its WebSocket connection
- * and waits for the response. The device WebSocket must support the
- * JsonRPC message format used by JetKVM firmware.
+ * Send a JsonRPC 2.0 request to a device via its Durable Object.
  *
- * Messages are wrapped in the signaling envelope:
- *   { type: "jsonrpc", data: <JsonRpcRequest> }
- *
- * The device is expected to respond with:
- *   { type: "jsonrpc", data: <JsonRpcResponse> }
+ * This replaces the direct WebSocket call from the Express version.
+ * The Durable Object handles the actual WebSocket communication.
  */
-export function sendJsonRpc(
-  ws: WebSocket,
+export async function sendJsonRpc(
+  env: Env,
+  deviceId: string,
   method: string,
   params: Record<string, unknown>,
   timeoutMs = 10000,
-): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const id = ++rpcIdCounter;
+): Promise<unknown> {
+  const doId = env.DEVICE_SIGNALING.idFromName(deviceId);
+  const stub = env.DEVICE_SIGNALING.get(doId);
 
-    const request: JsonRpcRequest = {
-      jsonrpc: "2.0",
-      method,
-      params,
-      id,
-    };
+  const resp = await stub.fetch(new Request("https://do/jsonrpc", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ method, params, timeoutMs }),
+  }));
 
-    const timer = setTimeout(() => {
-      cleanup();
-      reject(new Error(`JsonRPC timeout waiting for response to ${method}`));
-    }, timeoutMs);
+  const data = (await resp.json()) as {
+    result?: unknown;
+    error?: string;
+  };
 
-    function onMessage(data: Buffer | string) {
-      try {
-        const msg = JSON.parse(data.toString());
-        // Handle both envelope-wrapped and direct JsonRPC responses
-        const rpcResp: JsonRpcResponse =
-          msg.type === "jsonrpc" ? msg.data : msg;
+  if (!resp.ok || data.error) {
+    throw new Error(data.error || `JsonRPC call failed: ${method}`);
+  }
 
-        if (rpcResp.id !== id) return; // Not our response
-
-        cleanup();
-
-        if (rpcResp.error) {
-          reject(
-            new Error(
-              `JsonRPC error from device: ${rpcResp.error.message || JSON.stringify(rpcResp.error)}`,
-            ),
-          );
-        } else {
-          resolve(rpcResp.result);
-        }
-      } catch {
-        // Ignore non-JSON or unrelated messages
-      }
-    }
-
-    function cleanup() {
-      clearTimeout(timer);
-      ws.off("message", onMessage);
-    }
-
-    ws.on("message", onMessage);
-
-    ws.send(
-      JSON.stringify({
-        type: "jsonrpc",
-        data: request,
-      }),
-    );
-  });
+  return data.result;
 }
+

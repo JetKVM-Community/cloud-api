@@ -1,47 +1,94 @@
-import { type NextFunction, type Request, type Response } from "express";
+import type { MiddlewareHandler } from "hono";
 import * as jose from "jose";
 import { UnauthorizedError } from "./errors";
+import type { AppType } from "./env";
 
-const ALLOWED_IDENTITIES = process.env.ALLOWED_IDENTITIES?.split(",")
-    .map((identity) => identity.trim().toLowerCase())
+export function getAllowedIdentities(
+  allowed?: string,
+): Set<string> | null {
+  if (!allowed) return null;
+  const list = allowed
+    .split(",")
+    .map((id) => id.trim().toLowerCase())
     .filter(Boolean);
+  return list.length > 0 ? new Set(list) : null;
+}
 
-const getAllowedIdentities = () => {
-  if (!ALLOWED_IDENTITIES) return null;
-  return ALLOWED_IDENTITIES.length > 0 ? new Set(ALLOWED_IDENTITIES) : null;
+export const isIdentityAllowed = (
+  identity?: string | null,
+  allowedSet?: Set<string> | null,
+) => {
+  if (!allowedSet) return true;
+  const normalized = identity?.trim().toLowerCase();
+  if (!normalized) return false;
+  return allowedSet.has(normalized);
 };
 
-export const isIdentityAllowed = (identity?: string | null) => {
-  const allowedIdentities = getAllowedIdentities();
-  const identityNormalized = identity?.trim().toLowerCase();
-  if (!allowedIdentities) return true;
-  if (!identityNormalized) return false;
-  return allowedIdentities.has(identityNormalized);
-};
+// ---------------------------------------------------------------------------
+// Generic OIDC discovery cache
+// ---------------------------------------------------------------------------
+interface OidcDiscovery {
+  issuer: string;
+  jwks_uri: string;
+}
 
-export const verifyToken = async (idToken: string) => {
-  const JWKS = jose.createRemoteJWKSet(
-    new URL("https://www.googleapis.com/oauth2/v3/certs"),
-  );
+let cachedDiscovery: OidcDiscovery | null = null;
+let cachedJWKS: jose.FlattenedJWSInput extends infer _T
+  ? ReturnType<typeof jose.createRemoteJWKSet>
+  : never;
 
+async function getOidcDiscovery(issuer: string): Promise<OidcDiscovery> {
+  if (cachedDiscovery) return cachedDiscovery;
+  const url = `${issuer.replace(/\/+$/, "")}/.well-known/openid-configuration`;
+  const resp = await fetch(url);
+  cachedDiscovery = (await resp.json()) as OidcDiscovery;
+  return cachedDiscovery;
+}
+
+function getJWKS(jwksUri: string) {
+  if (!cachedJWKS) {
+    cachedJWKS = jose.createRemoteJWKSet(new URL(jwksUri));
+  }
+  return cachedJWKS;
+}
+
+// ---------------------------------------------------------------------------
+// Token verification — uses OIDC discovery to resolve JWKS & issuer
+// ---------------------------------------------------------------------------
+
+export const verifyToken = async (
+  idToken: string,
+  issuer: string,
+  clientId: string,
+) => {
   try {
-    const { payload } = await jose.jwtVerify(idToken, JWKS, {
-      issuer: "https://accounts.google.com",
-      audience: process.env.GOOGLE_CLIENT_ID,
-    });
+    const discovery = await getOidcDiscovery(issuer);
+    const JWKS = getJWKS(discovery.jwks_uri);
 
+    const { payload } = await jose.jwtVerify(idToken, JWKS, {
+      issuer: discovery.issuer,
+      audience: clientId,
+    });
     return payload;
-  } catch  (e) {
+  } catch (e) {
     console.error(e);
     return null;
   }
 };
 
-export const authenticated = async (req: Request, res: Response, next: NextFunction) => {
-  const idToken = req.session?.id_token;
+/**
+ * Hono middleware: verifies the session id_token is valid.
+ */
+export const authenticated: MiddlewareHandler<AppType> = async (c, next) => {
+  const session = c.get("session");
+  const idToken = session?.id_token;
   if (!idToken) throw new UnauthorizedError();
 
-  const payload = await verifyToken(idToken);
+  const payload = await verifyToken(
+    idToken,
+    c.env.OIDC_ISSUER,
+    c.env.OIDC_CLIENT_ID,
+  );
   if (!payload) throw new UnauthorizedError();
   if (!payload.exp) throw new UnauthorizedError();
 
@@ -50,9 +97,14 @@ export const authenticated = async (req: Request, res: Response, next: NextFunct
   }
 
   const email = (payload as { email?: string }).email;
-  if (!isIdentityAllowed(email)) {
-    throw new UnauthorizedError("Account is not in the allowlist", "account_not_allowed");
+  const allowedIdentities = getAllowedIdentities(c.env.ALLOWED_IDENTITIES);
+  if (!isIdentityAllowed(email, allowedIdentities)) {
+    throw new UnauthorizedError(
+      "Account is not in the allowlist",
+      "account_not_allowed",
+    );
   }
 
-  next();
+  await next();
 };
+

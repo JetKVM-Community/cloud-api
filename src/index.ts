@@ -1,9 +1,12 @@
-import express from "express";
-import cors from "cors";
-import cookieSession from "cookie-session";
+import { Hono } from "hono";
+import { cors } from "hono/cors";
 import * as jose from "jose";
-import helmet from "helmet";
-import 'dotenv/config';
+
+import type { AppType } from "./env";
+import { createPrisma } from "./db";
+import { sessionMiddleware } from "./session";
+import { authenticated } from "./auth";
+import { HttpError } from "./errors";
 
 import * as Devices from "./devices";
 import * as OIDC from "./oidc";
@@ -11,214 +14,202 @@ import * as Webrtc from "./webrtc";
 import * as Releases from "./releases";
 import { redfishRouter } from "./redfish";
 
-import { HttpError } from "./errors";
-import { authenticated } from "./auth";
-import { prisma } from "./db";
-import { initializeWebRTCSignaling } from "./webrtc-signaling";
+// Re-export the Durable Object so wrangler can discover it
+export { DeviceSignaling } from "./signaling";
 
-declare global {
-  namespace NodeJS {
-    interface ProcessEnv {
-      NODE_ENV: "development" | "production";
-      PORT: string;
+const app = new Hono<AppType>();
 
-      API_HOSTNAME: string;
-      APP_HOSTNAME: string;
-      COOKIE_SECRET: string;
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
 
-      // We use Google OIDC for authentication
-      GOOGLE_CLIENT_ID: string;
-      GOOGLE_CLIENT_SECRET: string;
-
-      // We use Cloudflare STUN & TURN server for cloud users
-      CLOUDFLARE_TURN_ID: string;
-      CLOUDFLARE_TURN_TOKEN: string;
-
-      // We use R2 for storing releases
-      R2_ENDPOINT: string;
-      R2_ACCESS_KEY_ID: string;
-      R2_SECRET_ACCESS_KEY: string;
-      R2_BUCKET: string;
-      R2_CDN_URL: string;
-
-      CORS_ORIGINS: string;
-
-      // Real IP
-      REAL_IP_HEADER: string;
-      ICE_SERVERS: string;
-
-      ALLOWED_IDENTITIES?: string;
-    }
-  }
-}
-
-const PORT = process.env.PORT || 3000;
-
-const app = express();
-app.use(helmet());
-app.disable("x-powered-by");
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// CORS
 app.use(
-  cors({
-    origin: process.env.CORS_ORIGINS?.split(",") || [
+  "*",
+  async (c, next) => {
+    const origins = c.env.CORS_ORIGINS?.split(",") || [
       "https://app.jetkvm.com",
       "http://localhost:5173",
-    ],
-    credentials: true,
-  }),
-);
-export const cookieSessionMiddleware = cookieSession({
-  name: "session",
-  path: "/",
-  httpOnly: true,
-  keys: [process.env.COOKIE_SECRET],
-  secure: process.env.NODE_ENV === "production",
-  sameSite: "strict",
-  maxAge: 24 * 60 * 60 * 1000, // 24 hours
-});
-
-app.use(cookieSessionMiddleware);
-
-// express-session won't sent the cookie, as it's `secure` and `secureProxy` is set to true
-// DO Apps doesn't send a X-Forwarded-Proto header, so we simply need to make a blanket trust
-app.set("trust proxy", true);
-
-app.get("/", (req, res) => {
-  return res.status(200).send("OK");
-});
-
-app.get("/healthz", (req, res) => {
-  return res.status(200).send({
-    ready: true,
-    time: new Date()
-  })
-});
-
-app.get(
-  "/me",
-  authenticated,
-  async (req: express.Request, res: express.Response) => {
-    const idToken = req.session?.id_token;
-    const { sub, iss, exp, aud, iat, jti, nbf } = jose.decodeJwt(idToken);
-
-    let user;
-    if (iss === "https://accounts.google.com") {
-      user = await prisma.user.findUnique({
-        where: { googleId: sub },
-        select: { picture: true, email: true },
-      });
-    }
-
-    return res.json({ ...user, sub });
+    ];
+    return cors({
+      origin: origins,
+      credentials: true,
+    })(c, next);
   },
 );
 
-// Redfish compatibility layer
-app.use("/redfish", redfishRouter);
+// Session (cookie-based, signed with HMAC-SHA256)
+app.use("*", sessionMiddleware());
 
-app.get("/releases", Releases.Retrieve);
-app.get(
-  "/releases/system_recovery/latest",
-  Releases.RetrieveLatestSystemRecovery,
+// Per-request Prisma client backed by D1
+app.use("*", async (c, next) => {
+  const prisma = createPrisma(c.env.DB);
+  c.set("prisma", prisma);
+  await next();
+});
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+app.get("/", (c) => c.text("OK"));
+
+app.get("/healthz", (c) =>
+  c.json({ ready: true, time: new Date().toISOString() }),
 );
+
+app.get("/me", authenticated, async (c) => {
+  const session = c.get("session");
+  const prisma = c.get("prisma");
+  const idToken = session.id_token!;
+  const { sub } = jose.decodeJwt(idToken);
+
+  const user = await prisma.user.findUnique({
+    where: { oidcId: sub },
+    select: { picture: true, email: true },
+  });
+
+  return c.json({ ...user, sub });
+});
+
+// Redfish compatibility layer
+app.route("/redfish", redfishRouter);
+
+// Releases
+app.get("/releases", Releases.Retrieve);
+app.get("/releases/system_recovery/latest", Releases.RetrieveLatestSystemRecovery);
 app.get("/releases/app/latest", Releases.RetrieveLatestApp);
 
+// Devices
 app.get("/devices", authenticated, Devices.List);
 app.get("/devices/:id", authenticated, Devices.Retrieve);
 app.post("/devices/token", Devices.Token);
 app.put("/devices/:id", authenticated, Devices.Update);
 app.delete("/devices/:id", Devices.Delete);
 
+// WebRTC
 app.post("/webrtc/session", authenticated, Webrtc.CreateSession);
 app.post("/webrtc/ice_config", authenticated, Webrtc.CreateIceCredentials);
-app.post(
-  "/webrtc/turn_activity",
-  authenticated,
-  Webrtc.CreateTurnActivity,
-);
+app.post("/webrtc/turn_activity", authenticated, Webrtc.CreateTurnActivity);
 
-app.post("/oidc/google", OIDC.Google);
+// OIDC
+app.post("/oidc/login", OIDC.Login);
 app.get("/oidc/callback_o", OIDC.Callback);
-app.get("/oidc/callback", (req, res) => {
-  /*
-   * We set the session cookie in the /oidc/google route as a part of 302 redirect to the OIDC login page
-   * When the OIDC provider redirects back to the /oidc/callback route, the session cookie won't be sent as it seen by the browser as a new session,
-   * and SameSite=Lax|Strict doesn't regard it as a same-site request.
-   *
-   * One solution, is to simply to use SameSite=None; Secure. Not nice for CSRF, and safari doesn't like it.
-   * Another solution is to simply return 200 and then redirect with HTML to the /oidc/callback_o route, which will have the session cookie.
-   * We went with the latter, and now we can have SameSite=Strict cookies:
-   * https://stackoverflow.com/questions/42216700/how-can-i-redirect-after-oauth2-with-samesite-strict-and-still-get-my-cookies
-   * */
-  const callbackUrl = req.url.replace("/oidc/callback", "/oidc/callback_o");
-  return res.send(
-    `<html>
-      <head>
-        <meta http-equiv="refresh" content="0; URL='${callbackUrl}'"/>
-        <script>
-          // Initial theme setup
-          document.documentElement.classList.toggle(
-            "dark",
-            localStorage.theme === "dark" ||
-              (!("theme" in localStorage) &&
-                window.matchMedia("(prefers-color-scheme: dark)").matches),
-          );
+app.get("/oidc/callback", OIDC.CallbackIntermediate);
 
-          // Listen for system theme changes
-          window
-            .matchMedia("(prefers-color-scheme: dark)")
-            .addEventListener("change", ({ matches }) => {
-              if (!("theme" in localStorage)) {
-                // Only auto-switch if user hasn't manually set a theme
-                document.documentElement.classList.toggle("dark", matches);
-              }
-            });
-        </script>
-        <style>
-          body {background-color: #0f172a;}
-        </style>
-      </head>
-      <body></body>
-    </html>`,
+// Logout
+app.post("/logout", (c) => {
+  c.set("session", null as any);
+  return c.json({ message: "Logged out" });
+});
+
+// ---------------------------------------------------------------------------
+// WebSocket upgrade routes (device + client signaling via Durable Object)
+// ---------------------------------------------------------------------------
+
+/**
+ * Device WebSocket registration.
+ * Devices connect here with Authorization header.
+ * The request is upgraded and forwarded to the device's Durable Object.
+ */
+app.get("/ws/device", async (c) => {
+  const upgradeHeader = c.req.header("Upgrade");
+  if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+    return c.text("WebSocket upgrade required", 426);
+  }
+
+  const prisma = c.get("prisma");
+
+  // Authenticate device
+  const authHeader = c.req.header("Authorization");
+  const secretToken = authHeader?.split(" ")?.[1];
+  if (!secretToken) {
+    return c.text("Unauthorized", 401);
+  }
+
+  const deviceId = c.req.header("X-Device-Id");
+  if (!deviceId) {
+    return c.text("Missing device ID", 400);
+  }
+
+  const device = await prisma.device.findFirst({
+    where: { id: deviceId, secretToken },
+  });
+  if (!device) {
+    return c.text("Invalid credentials", 401);
+  }
+
+  // Forward upgrade to the Durable Object
+  const doId = c.env.DEVICE_SIGNALING.idFromName(device.id);
+  const stub = c.env.DEVICE_SIGNALING.get(doId);
+
+  const doReq = new Request("https://do/connect/device", {
+    headers: {
+      Upgrade: "websocket",
+      "CF-Connecting-IP": c.req.header("CF-Connecting-IP") || c.req.header("X-Real-IP") || "",
+      "X-App-Version": c.req.header("X-App-Version") || "",
+    },
+  });
+
+  return stub.fetch(doReq);
+});
+
+/**
+ * Client WebSocket signaling.
+ * Authenticated clients connect here to perform WebRTC signaling with a device.
+ */
+app.get("/webrtc/signaling/client", async (c) => {
+  const upgradeHeader = c.req.header("Upgrade");
+  if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
+    return c.text("WebSocket upgrade required", 426);
+  }
+
+  const session = c.get("session");
+  const prisma = c.get("prisma");
+  const idToken = session?.id_token;
+  if (!idToken) {
+    return c.text("Unauthorized", 401);
+  }
+
+  const { sub } = jose.decodeJwt(idToken);
+  const deviceId = c.req.query("id");
+  if (!deviceId) {
+    return c.text("Missing device ID", 400);
+  }
+
+  // Verify device ownership
+  const device = await prisma.device.findUnique({
+    where: { id: deviceId, user: { oidcId: sub } },
+    select: { id: true },
+  });
+  if (!device) {
+    return c.text("Device not found", 404);
+  }
+
+  // Forward upgrade to the Durable Object
+  const doId = c.env.DEVICE_SIGNALING.idFromName(deviceId);
+  const stub = c.env.DEVICE_SIGNALING.get(doId);
+
+  const doReq = new Request("https://do/connect/client", {
+    headers: { Upgrade: "websocket" },
+  });
+
+  return stub.fetch(doReq);
+});
+
+// ---------------------------------------------------------------------------
+// Error handling
+// ---------------------------------------------------------------------------
+app.onError((err, c) => {
+  const statusCode = err instanceof HttpError ? err.status : 500;
+  console.error(err);
+  return c.json(
+    {
+      name: err.name,
+      message: err.message,
+    },
+    statusCode as any,
   );
 });
 
-app.post(
-  "/logout",
-  (req: express.Request, res: express.Response) => {
-    req.session = null;
-    return res.json({ message: "Logged out" });
-  }
-);
-
-// Error-handling middleware
-app.use(
-  (
-    err: HttpError | Error,
-    req: express.Request,
-    res: express.Response,
-    next: express.NextFunction,
-  ): void => {
-    const isProduction = process.env.NODE_ENV === "production";
-    const statusCode = err instanceof HttpError ? err.status : 500;
-
-    // Build the error response payload
-    const payload = {
-      name: err.name,
-      message: err.message,
-      ...(isProduction ? {} : { stack: err.stack }),
-    };
-
-    console.error(err);
-
-    res.status(statusCode).json(payload);
-  },
-);
-
-const server = app.listen(PORT, () => {
-  console.log("Server started on port " + PORT);
-});
-
-initializeWebRTCSignaling(server);
+export default app;

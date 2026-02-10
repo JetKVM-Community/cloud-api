@@ -1,22 +1,9 @@
-import { Request, Response } from "express";
-import { prisma } from "./db";
+import type { Context } from "hono";
+import type { AppType } from "./env";
 import { BadRequestError, InternalServerError, NotFoundError } from "./errors";
 import semver from "semver";
-
-import {
-  GetObjectCommand,
-  HeadObjectCommand,
-  ListObjectsV2Command,
-  S3Client,
-} from "@aws-sdk/client-s3";
 import { LRUCache } from "lru-cache";
-
-import {
-  getDeviceRolloutBucket,
-  streamToString,
-  toSemverRange,
-  verifyHash,
-} from "./helpers";
+import { getDeviceRolloutBucket, toSemverRange, verifyHash } from "./helpers";
 import { z, ZodError } from "zod";
 
 const DEFAULT_SKU = "jetkvm-v2";
@@ -67,9 +54,9 @@ type RetrieveQuery = z.infer<typeof retrieveQuerySchema>;
 /**
  * Parses query parameters and converts ZodError to BadRequestError.
  */
-function parseQuery<T>(schema: z.ZodSchema<T>, req: Request): T {
+function parseQuery<T>(schema: z.ZodSchema<T>, c: Context<AppType>): T {
   try {
-    return schema.parse(req.query);
+    return schema.parse(c.req.query());
   } catch (error) {
     if (error instanceof ZodError) {
       const message = error.issues.map((e: z.ZodIssue) => e.message).join(", ");
@@ -87,15 +74,6 @@ export interface ReleaseMetadata {
   _maxSatisfying?: string;
 }
 
-const s3Client = new S3Client({
-  endpoint: process.env.R2_ENDPOINT!,
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!,
-  },
-  region: "auto",
-});
-
 const releaseCache = new LRUCache<string, ReleaseMetadata>({
   max: 1000,
   ttl: 5 * 60 * 1000, // 5 minutes
@@ -112,28 +90,16 @@ export function clearCaches() {
   redirectCache.clear();
 }
 
-const bucketName = process.env.R2_BUCKET;
-const baseUrl = process.env.R2_CDN_URL;
+// ---------------------------------------------------------------------------
+// R2 helpers
+// ---------------------------------------------------------------------------
 
 /**
- * Checks if an object exists in S3/R2 by attempting a HeadObjectCommand.
- * Returns true if the object exists, false otherwise.
+ * Checks if an object exists in R2 by attempting a head request.
  */
-async function s3ObjectExists(key: string): Promise<boolean> {
-  try {
-    await s3Client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }));
-    return true;
-  } catch (error: any) {
-    // HeadObjectCommand throws NotFound, but some S3-compatible stores (like R2) may throw NoSuchKey
-    if (
-      error.name === "NotFound" ||
-      error.name === "NoSuchKey" ||
-      error.$metadata?.httpStatusCode === 404
-    ) {
-      return false;
-    }
-    throw error;
-  }
+async function r2ObjectExists(bucket: R2Bucket, key: string): Promise<boolean> {
+  const obj = await bucket.head(key);
+  return obj !== null;
 }
 
 /**
@@ -141,17 +107,15 @@ async function s3ObjectExists(key: string): Promise<boolean> {
  * Returns true if any skus/ subfolder exists for this version.
  */
 async function versionHasSkuSupport(
+  bucket: R2Bucket,
   prefix: "app" | "system",
   version: string,
 ): Promise<boolean> {
-  const response = await s3Client.send(
-    new ListObjectsV2Command({
-      Bucket: bucketName,
-      Prefix: `${prefix}/${version}/skus/`,
-      MaxKeys: 1,
-    }),
-  );
-  return (response.Contents?.length ?? 0) > 0;
+  const response = await bucket.list({
+    prefix: `${prefix}/${version}/skus/`,
+    limit: 1,
+  });
+  return response.objects.length > 0;
 }
 
 /**
@@ -166,12 +130,14 @@ async function versionHasSkuSupport(
  *   - Fails for non-default SKUs because legacy firmware predates
  *     that hardware and may not be compatible
  *
+ * @param bucket - The R2 bucket
  * @param prefix - The prefix folder ("app" or "system")
  * @param version - The version string
  * @param sku - SKU identifier (defaults to jetkvm-v2 from schema)
  * @param artifactOverride - Optional artifact name override (defaults based on prefix)
  */
 async function resolveArtifactPath(
+  bucket: R2Bucket,
   prefix: "app" | "system",
   version: string,
   sku: string,
@@ -179,10 +145,10 @@ async function resolveArtifactPath(
 ): Promise<string> {
   const artifact = artifactOverride ?? (prefix === "app" ? "jetkvm_app" : "system.tar");
 
-  if (await versionHasSkuSupport(prefix, version)) {
+  if (await versionHasSkuSupport(bucket, prefix, version)) {
     const skuPath = `${prefix}/${version}/skus/${sku}/${artifact}`;
 
-    if (await s3ObjectExists(skuPath)) {
+    if (await r2ObjectExists(bucket, skuPath)) {
       return skuPath;
     }
 
@@ -204,6 +170,8 @@ async function resolveArtifactPath(
 }
 
 async function getLatestVersion(
+  bucket: R2Bucket,
+  cdnUrl: string,
   prefix: "app" | "system",
   includePrerelease: boolean,
   maxSatisfying: string = "*",
@@ -213,20 +181,18 @@ async function getLatestVersion(
   const cached = releaseCache.get(cacheKey);
   if (cached) return cached;
 
-  const listCommand = new ListObjectsV2Command({
-    Bucket: bucketName,
-    Prefix: prefix + "/",
-    Delimiter: "/",
+  const response = await bucket.list({
+    prefix: prefix + "/",
+    delimiter: "/",
   });
 
-  const response = await s3Client.send(listCommand);
-
-  if (!response.CommonPrefixes || response.CommonPrefixes.length === 0) {
+  if (!response.delimitedPrefixes || response.delimitedPrefixes.length === 0) {
     throw new NotFoundError(`No versions found under prefix ${prefix}`);
   }
 
   // Extract version folder names
-  let versions = response.CommonPrefixes.map(cp => cp.Prefix!.split("/")[1])
+  let versions = response.delimitedPrefixes
+    .map(p => p.split("/")[1])
     .filter(Boolean)
     .filter(v => semver.valid(v));
 
@@ -244,17 +210,14 @@ async function getLatestVersion(
     );
   }
 
-  const selectedPath = await resolveArtifactPath(prefix, latestVersion, sku);
-  const url = `${baseUrl}/${selectedPath}`;
+  const selectedPath = await resolveArtifactPath(bucket, prefix, latestVersion, sku);
+  const url = `${cdnUrl}/${selectedPath}`;
 
-  const hashResponse = await s3Client.send(
-    new GetObjectCommand({
-      Bucket: bucketName,
-      Key: `${selectedPath}.sha256`,
-    }),
-  );
-
-  const hash = await streamToString(hashResponse.Body);
+  const hashObj = await bucket.get(`${selectedPath}.sha256`);
+  if (!hashObj) {
+    throw new NotFoundError(`Hash file not found for ${selectedPath}`);
+  }
+  const hash = await hashObj.text();
 
   // Cache the release metadata
   const release = {
@@ -308,7 +271,9 @@ function toRelease(
   return release as Release;
 }
 
-async function getReleaseFromS3(
+async function getReleaseFromR2(
+  bucket: R2Bucket,
+  cdnUrl: string,
   includePrerelease: boolean,
   {
     appVersion,
@@ -317,8 +282,8 @@ async function getReleaseFromS3(
   }: { appVersion?: string; systemVersion?: string; sku: string },
 ): Promise<Release> {
   const [appRelease, systemRelease] = await Promise.all([
-    getLatestVersion("app", includePrerelease, appVersion, sku),
-    getLatestVersion("system", includePrerelease, systemVersion, sku),
+    getLatestVersion(bucket, cdnUrl, "app", includePrerelease, appVersion, sku),
+    getLatestVersion(bucket, cdnUrl, "system", includePrerelease, systemVersion, sku),
   ]);
 
   return toRelease(appRelease, systemRelease);
@@ -329,10 +294,11 @@ async function isDeviceEligibleForLatestRelease(
   deviceId: string,
 ): Promise<boolean> {
   if (rolloutPercentage === 100) return true;
-  return getDeviceRolloutBucket(deviceId) < rolloutPercentage;
+  return (await getDeviceRolloutBucket(deviceId)) < rolloutPercentage;
 }
 
-async function getDefaultRelease(type: "app" | "system") {
+async function getDefaultRelease(c: Context<AppType>, type: "app" | "system") {
+  const prisma = c.get("prisma");
   const rolledOutReleases = await prisma.release.findMany({
     where: { rolloutPercentage: 100, type },
     select: { version: true, url: true, hash: true },
@@ -358,17 +324,20 @@ async function getDefaultRelease(type: "app" | "system") {
   return latestDefaultRelease;
 }
 
-export async function Retrieve(req: Request, res: Response) {
-  const query = parseQuery(retrieveQuerySchema, req);
+export async function Retrieve(c: Context<AppType>) {
+  const query = parseQuery(retrieveQuerySchema, c);
+  const prisma = c.get("prisma");
+  const bucket = c.env.R2_BUCKET;
+  const cdnUrl = c.env.R2_CDN_URL;
 
   const appVersion = toSemverRange(query.appVersion);
   const systemVersion = toSemverRange(query.systemVersion);
   const skipRollout = appVersion !== "*" || systemVersion !== "*";
 
-  // Get the latest release from S3
+  // Get the latest release from R2
   let remoteRelease: Release;
   try {
-    remoteRelease = await getReleaseFromS3(query.prerelease, {
+    remoteRelease = await getReleaseFromR2(bucket, cdnUrl, query.prerelease, {
       appVersion,
       systemVersion,
       sku: query.sku,
@@ -378,7 +347,7 @@ export async function Retrieve(req: Request, res: Response) {
     if (error instanceof NotFoundError) {
       throw error;
     }
-    throw new InternalServerError(`Failed to get the latest release from S3: ${error}`);
+    throw new InternalServerError(`Failed to get the latest release from R2: ${error}`);
   }
 
   // If the request is for prereleases, ignore the rollout percentage and just return the latest release
@@ -387,7 +356,7 @@ export async function Retrieve(req: Request, res: Response) {
 
   // If the version isn't a wildcard, we skip the rollout percentage check
   if (query.prerelease || skipRollout) {
-    return res.json(remoteRelease);
+    return c.json(remoteRelease);
   }
 
   // Fetch or create the latest app release
@@ -424,11 +393,11 @@ export async function Retrieve(req: Request, res: Response) {
     Background update checks follow the normal rollout percentage rules, to ensure controlled, gradual deployment of updates.
   */
   if (query.forceUpdate) {
-    return res.json(toRelease(latestAppRelease, latestSystemRelease));
+    return c.json(toRelease(latestAppRelease, latestSystemRelease));
   }
 
-  const defaultAppRelease = await getDefaultRelease("app");
-  const defaultSystemRelease = await getDefaultRelease("system");
+  const defaultAppRelease = await getDefaultRelease(c, "app");
+  const defaultSystemRelease = await getDefaultRelease(c, "system");
 
   const responseJson = toRelease(defaultAppRelease, defaultSystemRelease);
 
@@ -450,22 +419,22 @@ export async function Retrieve(req: Request, res: Response) {
     setSystemRelease(responseJson, latestSystemRelease);
   }
 
-  return res.json(responseJson);
+  return c.json(responseJson);
 }
 
 function cachedRedirect(
   cachedKey: (query: LatestQuery) => string,
-  callback: (query: LatestQuery) => Promise<string>,
+  callback: (c: Context<AppType>, query: LatestQuery) => Promise<string>,
 ) {
-  return async (req: Request, res: Response) => {
-    const query = parseQuery(latestQuerySchema, req);
+  return async (c: Context<AppType>) => {
+    const query = parseQuery(latestQuerySchema, c);
     const cacheKey = cachedKey(query);
     let result = redirectCache.get(cacheKey);
     if (!result) {
-      result = await callback(query);
+      result = await callback(c, query);
       redirectCache.set(cacheKey, result);
     }
-    return res.redirect(302, result);
+    return c.redirect(result, 302);
   };
 }
 
@@ -478,22 +447,24 @@ function releaseCacheKey(prefix: string, query: LatestQuery): string {
 
 export const RetrieveLatestSystemRecovery = cachedRedirect(
   query => releaseCacheKey("system-recovery", query),
-  async query => {
-    // Get the latest system recovery image from S3. It's stored in the system/ folder.
-    const listCommand = new ListObjectsV2Command({
-      Bucket: bucketName,
-      Prefix: "system/",
-      Delimiter: "/",
+  async (c, query) => {
+    const bucket = c.env.R2_BUCKET;
+    const cdnUrl = c.env.R2_CDN_URL;
+
+    // Get the latest system recovery image from R2. It's stored in the system/ folder.
+    const response = await bucket.list({
+      prefix: "system/",
+      delimiter: "/",
     });
-    const response = await s3Client.send(listCommand);
 
     // Extract version folder names
-    if (!response.CommonPrefixes || response.CommonPrefixes.length === 0) {
+    if (!response.delimitedPrefixes || response.delimitedPrefixes.length === 0) {
       throw new NotFoundError(`No versions found under prefix system recovery image`);
     }
 
     // Get the latest version
-    const versions = response.CommonPrefixes.map(cp => cp.Prefix!.split("/")[1])
+    const versions = response.delimitedPrefixes
+      .map(p => p.split("/")[1])
       .filter(Boolean)
       .filter(v => semver.valid(v));
 
@@ -507,6 +478,7 @@ export const RetrieveLatestSystemRecovery = cachedRedirect(
 
     // Resolve the artifact path with SKU support (using update.img for recovery)
     const artifactPath = await resolveArtifactPath(
+      bucket,
       "system",
       latestVersion,
       query.sku,
@@ -514,53 +486,46 @@ export const RetrieveLatestSystemRecovery = cachedRedirect(
     );
 
     const [firmwareFile, hashFile] = await Promise.all([
-      // TODO: store file hash using custom header to avoid extra request
-      s3Client.send(
-        new GetObjectCommand({
-          Bucket: bucketName,
-          Key: artifactPath,
-        }),
-      ),
-      s3Client.send(
-        new GetObjectCommand({
-          Bucket: bucketName,
-          Key: `${artifactPath}.sha256`,
-        }),
-      ),
+      bucket.get(artifactPath),
+      bucket.get(`${artifactPath}.sha256`),
     ]);
 
-    if (!firmwareFile.Body || !hashFile.Body) {
+    if (!firmwareFile || !hashFile) {
       throw new NotFoundError(
         `No system recovery image or hash file not found for version ${latestVersion}`,
       );
     }
 
-    await verifyHash(firmwareFile, hashFile, "system recovery image hash does not match");
+    const firmwareBody = await firmwareFile.arrayBuffer();
+    const hashText = await hashFile.text();
+
+    await verifyHash(firmwareBody, hashText, "system recovery image hash does not match");
 
     console.log("system recovery image hash matches", latestVersion);
 
-    return `${baseUrl}/${artifactPath}`;
+    return `${cdnUrl}/${artifactPath}`;
   },
 );
 
 export const RetrieveLatestApp = cachedRedirect(
   query => releaseCacheKey("app", query),
-  async query => {
-    // Get the latest version
-    const listCommand = new ListObjectsV2Command({
-      Bucket: bucketName,
-      Prefix: "app/",
-      Delimiter: "/",
-    });
-    const response = await s3Client.send(listCommand);
+  async (c, query) => {
+    const bucket = c.env.R2_BUCKET;
+    const cdnUrl = c.env.R2_CDN_URL;
 
-    if (!response.CommonPrefixes || response.CommonPrefixes.length === 0) {
+    // Get the latest version
+    const response = await bucket.list({
+      prefix: "app/",
+      delimiter: "/",
+    });
+
+    if (!response.delimitedPrefixes || response.delimitedPrefixes.length === 0) {
       throw new NotFoundError("No app versions found");
     }
 
-    const versions = response.CommonPrefixes.map(cp => cp.Prefix!.split("/")[1]).filter(
-      v => semver.valid(v),
-    );
+    const versions = response.delimitedPrefixes
+      .map(p => p.split("/")[1])
+      .filter(v => semver.valid(v));
 
     const latestVersion = semver.maxSatisfying(versions, "*", {
       includePrerelease: query.prerelease,
@@ -571,31 +536,24 @@ export const RetrieveLatestApp = cachedRedirect(
     }
 
     // Resolve the artifact path with SKU support
-    const artifactPath = await resolveArtifactPath("app", latestVersion, query.sku);
+    const artifactPath = await resolveArtifactPath(bucket, "app", latestVersion, query.sku);
 
     // Get the app file and its hash
     const [appFile, hashFile] = await Promise.all([
-      s3Client.send(
-        new GetObjectCommand({
-          Bucket: bucketName,
-          Key: artifactPath,
-        }),
-      ),
-      s3Client.send(
-        new GetObjectCommand({
-          Bucket: bucketName,
-          Key: `${artifactPath}.sha256`,
-        }),
-      ),
+      bucket.get(artifactPath),
+      bucket.get(`${artifactPath}.sha256`),
     ]);
 
-    if (!appFile.Body || !hashFile.Body) {
+    if (!appFile || !hashFile) {
       throw new NotFoundError(`App or hash file not found for version ${latestVersion}`);
     }
 
-    await verifyHash(appFile, hashFile, "app hash does not match");
+    const appBody = await appFile.arrayBuffer();
+    const hashText = await hashFile.text();
+
+    await verifyHash(appBody, hashText, "app hash does not match");
 
     console.log("App hash matches", latestVersion);
-    return `${baseUrl}/${artifactPath}`;
+    return `${cdnUrl}/${artifactPath}`;
   },
 );

@@ -1,7 +1,7 @@
-import { Router, type Request, type Response } from "express";
+import { Hono } from "hono";
+import type { Context, MiddlewareHandler } from "hono";
 import * as jose from "jose";
-import { prisma } from "./db";
-import { activeConnections } from "./webrtc-signaling";
+import type { AppType } from "./env";
 import { NotFoundError, BadRequestError } from "./errors";
 import { getResetKeySequence } from "./redfish-keys";
 import { sendJsonRpc } from "./jsonrpc";
@@ -32,18 +32,15 @@ const ODATA = {
 // Authentication middleware for Redfish
 // Supports both session-based (OIDC cookie) and HTTP Basic Auth
 // ---------------------------------------------------------------------------
-export async function redfishAuthenticated(
-  req: Request,
-  res: Response,
-  next: (err?: unknown) => void,
-) {
+export const redfishAuthenticated: MiddlewareHandler<AppType> = async (c, next) => {
   // Try session-based auth first (existing OIDC cookie)
-  const idToken = req.session?.id_token;
+  const session = c.get("session");
+  const idToken = session?.id_token;
   if (idToken) {
     try {
       const { sub } = jose.decodeJwt(idToken);
       if (sub) {
-        (req as any).redfishSub = sub;
+        c.set("redfishSub" as any, sub);
         return next();
       }
     } catch {
@@ -52,12 +49,13 @@ export async function redfishAuthenticated(
   }
 
   // Try HTTP Basic Auth (for machine-to-machine / Redfish clients)
-  const authHeader = req.headers.authorization;
+  const authHeader = c.req.header("Authorization");
   if (authHeader?.startsWith("Basic ")) {
-    const decoded = Buffer.from(authHeader.slice(6), "base64").toString("utf-8");
+    const decoded = atob(authHeader.slice(6));
     const [username, password] = decoded.split(":");
 
     if (username && password) {
+      const prisma = c.get("prisma");
       // Look up the device by its secret token (password) and device id (username)
       const device = await prisma.device.findFirst({
         where: { id: username, secretToken: password },
@@ -65,19 +63,23 @@ export async function redfishAuthenticated(
       });
 
       if (device?.user) {
-        (req as any).redfishSub = device.user.googleId;
+        c.set("redfishSub" as any, device.user.oidcId);
         return next();
       }
     }
 
-    return res.status(401).json(redfishError("Base.1.0.NoValidSession", "Invalid credentials."));
+    return c.json(
+      redfishError("Base.1.0.NoValidSession", "Invalid credentials."),
+      401,
+    );
   }
 
-  return res
-    .status(401)
-    .set("WWW-Authenticate", 'Basic realm="JetKVM Redfish Service"')
-    .json(redfishError("Base.1.0.NoValidSession", "Authentication required."));
-}
+  return c.json(
+    redfishError("Base.1.0.NoValidSession", "Authentication required."),
+    401,
+    { "WWW-Authenticate": 'Basic realm="JetKVM Redfish Service"' },
+  );
+};
 
 // ---------------------------------------------------------------------------
 // Redfish error response helper
@@ -103,34 +105,51 @@ function redfishError(code: string, message: string) {
 // ---------------------------------------------------------------------------
 // Helper: get user devices
 // ---------------------------------------------------------------------------
-async function getUserDevices(sub: string) {
+async function getUserDevices(c: Context<AppType>) {
+  const sub = c.get("redfishSub" as any) as string;
+  const prisma = c.get("prisma");
   return prisma.device.findMany({
-    where: { user: { googleId: sub } },
+    where: { user: { oidcId: sub } },
     select: { id: true, name: true, lastSeen: true },
   });
 }
 
-async function getUserDevice(sub: string, deviceId: string) {
+async function getUserDevice(c: Context<AppType>, deviceId: string) {
+  const sub = c.get("redfishSub" as any) as string;
+  const prisma = c.get("prisma");
   return prisma.device.findUnique({
-    where: { id: deviceId, user: { googleId: sub } },
+    where: { id: deviceId, user: { oidcId: sub } },
     select: { id: true, name: true, lastSeen: true },
   });
+}
+
+/**
+ * Helper to get device status (online/version) from its Durable Object.
+ */
+async function getDeviceStatus(
+  c: Context<AppType>,
+  deviceId: string,
+): Promise<{ online: boolean; version: string | null }> {
+  const doId = c.env.DEVICE_SIGNALING.idFromName(deviceId);
+  const stub = c.env.DEVICE_SIGNALING.get(doId);
+  const resp = await stub.fetch(new Request("https://do/status"));
+  return resp.json() as Promise<{ online: boolean; version: string | null }>;
 }
 
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
-export const redfishRouter = Router();
+export const redfishRouter = new Hono<AppType>();
 
-// All Redfish responses are JSON and include OData-Version header
-redfishRouter.use((_req, res, next) => {
-  res.set("OData-Version", "4.0");
-  next();
+// All Redfish responses include OData-Version header
+redfishRouter.use("*", async (c, next) => {
+  await next();
+  c.header("OData-Version", "4.0");
 });
 
 // -- Service Root (public, per Redfish spec) --------------------------------
-redfishRouter.get("/v1", (_req: Request, res: Response) => {
-  return res.json({
+redfishRouter.get("/v1", (c) => {
+  return c.json({
     "@odata.type": ODATA.SERVICE_ROOT,
     "@odata.id": "/redfish/v1",
     Id: "RootService",
@@ -143,13 +162,13 @@ redfishRouter.get("/v1", (_req: Request, res: Response) => {
   });
 });
 
-redfishRouter.get("/v1/", (_req: Request, res: Response) => {
-  return res.redirect(301, "/redfish/v1");
+redfishRouter.get("/v1/", (c) => {
+  return c.redirect("/redfish/v1", 301);
 });
 
 // -- Session Service (public metadata, per spec) ----------------------------
-redfishRouter.get("/v1/SessionService", (_req: Request, res: Response) => {
-  return res.json({
+redfishRouter.get("/v1/SessionService", (c) => {
+  return c.json({
     "@odata.type": ODATA.SESSION_SERVICE,
     "@odata.id": "/redfish/v1/SessionService",
     Id: "SessionService",
@@ -163,8 +182,8 @@ redfishRouter.get("/v1/SessionService", (_req: Request, res: Response) => {
 redfishRouter.get(
   "/v1/SessionService/Sessions",
   redfishAuthenticated,
-  (_req: Request, res: Response) => {
-    return res.json({
+  (c) => {
+    return c.json({
       "@odata.type": ODATA.SESSION_COLLECTION,
       "@odata.id": "/redfish/v1/SessionService/Sessions",
       Name: "Session Collection",
@@ -178,11 +197,10 @@ redfishRouter.get(
 redfishRouter.get(
   "/v1/Systems",
   redfishAuthenticated,
-  async (req: Request, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const devices = await getUserDevices(sub);
+  async (c) => {
+    const devices = await getUserDevices(c);
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.SYSTEMS_COLLECTION,
       "@odata.id": "/redfish/v1/Systems",
       Name: "Computer System Collection",
@@ -196,17 +214,22 @@ redfishRouter.get(
 redfishRouter.get(
   "/v1/Systems/:id",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("System not found");
 
-    const isOnline = activeConnections.has(device.id);
-    const conn = activeConnections.get(device.id);
-    const version = conn?.[2] || null;
+    let isOnline = false;
+    let version: string | null = null;
+    try {
+      const status = await getDeviceStatus(c, device.id);
+      isOnline = status.online;
+      version = status.version;
+    } catch {
+      // Device might not have a DO instance yet
+    }
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.COMPUTER_SYSTEM,
       "@odata.id": `/redfish/v1/Systems/${device.id}`,
       Id: device.id,
@@ -240,17 +263,17 @@ redfishRouter.get(
   },
 );
 
-// -- System Reset Action (sends keyboard combos via WebSocket) ---------------
+// -- System Reset Action (sends keyboard combos via Durable Object) ----------
 redfishRouter.post(
   "/v1/Systems/:id/Actions/ComputerSystem.Reset",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("System not found");
 
-    const { ResetType } = req.body as { ResetType?: string };
+    const body = await c.req.json();
+    const { ResetType } = body as { ResetType?: string };
     if (!ResetType) throw new BadRequestError("ResetType is required");
 
     const keySequence = getResetKeySequence(ResetType);
@@ -258,24 +281,20 @@ redfishRouter.post(
       throw new BadRequestError(`Unsupported ResetType: ${ResetType}`);
     }
 
-    const conn = activeConnections.get(device.id);
-    if (!conn) {
-      throw new NotFoundError("Device is not connected");
-    }
-
-    const [ws] = conn;
-
-    // Send keyboard commands via the device WebSocket
+    // Send keyboard commands via the device's Durable Object
     for (const combo of keySequence) {
-      ws.send(
-        JSON.stringify({
+      const doId = c.env.DEVICE_SIGNALING.idFromName(device.id);
+      const stub = c.env.DEVICE_SIGNALING.get(doId);
+      await stub.fetch(new Request("https://do/command", {
+        method: "POST",
+        body: JSON.stringify({
           type: "keyboard",
           data: { modifier: combo.modifier, keys: combo.keys },
         }),
-      );
+      }));
     }
 
-    return res.status(204).send();
+    return c.body(null, 204);
   },
 );
 
@@ -283,11 +302,10 @@ redfishRouter.post(
 redfishRouter.get(
   "/v1/Managers",
   redfishAuthenticated,
-  async (req: Request, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const devices = await getUserDevices(sub);
+  async (c) => {
+    const devices = await getUserDevices(c);
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.MANAGERS_COLLECTION,
       "@odata.id": "/redfish/v1/Managers",
       Name: "Manager Collection",
@@ -301,17 +319,22 @@ redfishRouter.get(
 redfishRouter.get(
   "/v1/Managers/:id",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("Manager not found");
 
-    const isOnline = activeConnections.has(device.id);
-    const conn = activeConnections.get(device.id);
-    const version = conn?.[2] || null;
+    let isOnline = false;
+    let version: string | null = null;
+    try {
+      const status = await getDeviceStatus(c, device.id);
+      isOnline = status.online;
+      version = status.version;
+    } catch {
+      // Device might not have a DO instance yet
+    }
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.MANAGER,
       "@odata.id": `/redfish/v1/Managers/${device.id}`,
       Id: device.id,
@@ -354,13 +377,12 @@ redfishRouter.get(
 redfishRouter.get(
   "/v1/Managers/:id/VirtualMedia",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("Manager not found");
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.VIRTUAL_MEDIA_COLLECTION,
       "@odata.id": `/redfish/v1/Managers/${device.id}/VirtualMedia`,
       Name: "Virtual Media Collection",
@@ -378,15 +400,15 @@ redfishRouter.get(
 redfishRouter.get(
   "/v1/Managers/:id/VirtualMedia/:mediaId",
   redfishAuthenticated,
-  async (req: Request<{ id: string; mediaId: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id, mediaId } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const mediaId = c.req.param("mediaId");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("Manager not found");
 
     if (mediaId !== "Disc1") throw new NotFoundError("VirtualMedia not found");
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.VIRTUAL_MEDIA,
       "@odata.id": `/redfish/v1/Managers/${device.id}/VirtualMedia/Disc1`,
       Id: "Disc1",
@@ -411,30 +433,34 @@ redfishRouter.get(
 redfishRouter.post(
   "/v1/Managers/:id/VirtualMedia/:mediaId/Actions/VirtualMedia.InsertMedia",
   redfishAuthenticated,
-  async (req: Request<{ id: string; mediaId: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id, mediaId } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const mediaId = c.req.param("mediaId");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("Manager not found");
 
     if (mediaId !== "Disc1")
       throw new NotFoundError("VirtualMedia not found");
 
-    const { Image } = req.body as { Image?: string };
+    const body = await c.req.json();
+    const { Image } = body as { Image?: string };
     if (!Image) throw new BadRequestError("Image URL is required");
 
-    const conn = activeConnections.get(device.id);
-    if (!conn) throw new NotFoundError("Device is not connected");
+    const doId = c.env.DEVICE_SIGNALING.idFromName(device.id);
+    const stub = c.env.DEVICE_SIGNALING.get(doId);
+    const resp = await stub.fetch(new Request("https://do/status"));
+    const status = (await resp.json()) as { online: boolean };
+    if (!status.online) throw new NotFoundError("Device is not connected");
 
-    const [ws] = conn;
-    ws.send(
-      JSON.stringify({
+    await stub.fetch(new Request("https://do/command", {
+      method: "POST",
+      body: JSON.stringify({
         type: "virtual-media",
         data: { action: "insert", url: Image },
       }),
-    );
+    }));
 
-    return res.status(204).send();
+    return c.body(null, 204);
   },
 );
 
@@ -442,56 +468,56 @@ redfishRouter.post(
 redfishRouter.post(
   "/v1/Managers/:id/VirtualMedia/:mediaId/Actions/VirtualMedia.EjectMedia",
   redfishAuthenticated,
-  async (req: Request<{ id: string; mediaId: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id, mediaId } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const mediaId = c.req.param("mediaId");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("Manager not found");
 
     if (mediaId !== "Disc1")
       throw new NotFoundError("VirtualMedia not found");
 
-    const conn = activeConnections.get(device.id);
-    if (!conn) throw new NotFoundError("Device is not connected");
+    const doId = c.env.DEVICE_SIGNALING.idFromName(device.id);
+    const stub = c.env.DEVICE_SIGNALING.get(doId);
+    const resp = await stub.fetch(new Request("https://do/status"));
+    const status = (await resp.json()) as { online: boolean };
+    if (!status.online) throw new NotFoundError("Device is not connected");
 
-    const [ws] = conn;
-    ws.send(
-      JSON.stringify({
+    await stub.fetch(new Request("https://do/command", {
+      method: "POST",
+      body: JSON.stringify({
         type: "virtual-media",
         data: { action: "eject" },
       }),
-    );
+    }));
 
-    return res.status(204).send();
+    return c.body(null, 204);
   },
 );
 
 // -- OEM: JetKVM Extensions -------------------------------------------------
-// These endpoints expose the JetKVM extension system via Redfish OEM properties,
-// following the JsonRPC patterns from https://github.com/jetkvm/kvm/blob/dev/jsonrpc.go
 
-// Helper to get a connected device and its WebSocket for RPC calls
-async function getDeviceForRpc(sub: string, deviceId: string) {
-  const device = await getUserDevice(sub, deviceId);
+// Helper to get a connected device for RPC calls via Durable Object
+async function getDeviceForRpc(c: Context<AppType>, deviceId: string) {
+  const device = await getUserDevice(c, deviceId);
   if (!device) throw new NotFoundError("Manager not found");
 
-  const conn = activeConnections.get(device.id);
-  if (!conn) throw new NotFoundError("Device is not connected");
+  const status = await getDeviceStatus(c, device.id);
+  if (!status.online) throw new NotFoundError("Device is not connected");
 
-  return { device, ws: conn[0] };
+  return device;
 }
 
 // -- Extensions overview ----------------------------------------------------
 redfishRouter.get(
   "/v1/Managers/:id/Oem/JetKVM/Extensions",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+  async (c) => {
+    const device = await getDeviceForRpc(c, c.req.param("id"));
 
-    const activeExtension = await sendJsonRpc(ws, "getActiveExtension", {});
+    const activeExtension = await sendJsonRpc(c.env, device.id, "getActiveExtension", {});
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.JETKVM_EXTENSIONS,
       "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/Extensions`,
       Id: "Extensions",
@@ -515,13 +541,12 @@ redfishRouter.get(
 redfishRouter.get(
   "/v1/Managers/:id/Oem/JetKVM/Extensions/Active",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+  async (c) => {
+    const device = await getDeviceForRpc(c, c.req.param("id"));
 
-    const activeExtension = await sendJsonRpc(ws, "getActiveExtension", {});
+    const activeExtension = await sendJsonRpc(c.env, device.id, "getActiveExtension", {});
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.JETKVM_ACTIVE_EXTENSION,
       "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/Extensions/Active`,
       Id: "Active",
@@ -535,16 +560,16 @@ redfishRouter.get(
 redfishRouter.post(
   "/v1/Managers/:id/Oem/JetKVM/Extensions/Actions/SetActiveExtension",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+  async (c) => {
+    const device = await getDeviceForRpc(c, c.req.param("id"));
 
-    const { extensionId } = req.body as { extensionId?: string };
+    const body = await c.req.json();
+    const { extensionId } = body as { extensionId?: string };
     if (extensionId === undefined) throw new BadRequestError("extensionId is required");
 
-    await sendJsonRpc(ws, "setActiveExtension", { extensionId });
+    await sendJsonRpc(c.env, device.id, "setActiveExtension", { extensionId });
 
-    return res.status(204).send();
+    return c.body(null, 204);
   },
 );
 
@@ -552,13 +577,12 @@ redfishRouter.post(
 redfishRouter.get(
   "/v1/Managers/:id/Oem/JetKVM/DCPower",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+  async (c) => {
+    const device = await getDeviceForRpc(c, c.req.param("id"));
 
-    const dcState = await sendJsonRpc(ws, "getDCPowerState", {});
+    const dcState = (await sendJsonRpc(c.env, device.id, "getDCPowerState", {})) as any;
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.JETKVM_DC_POWER,
       "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/DCPower`,
       Id: "DCPower",
@@ -581,16 +605,16 @@ redfishRouter.get(
 redfishRouter.post(
   "/v1/Managers/:id/Oem/JetKVM/DCPower/Actions/SetState",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+  async (c) => {
+    const device = await getDeviceForRpc(c, c.req.param("id"));
 
-    const { enabled } = req.body as { enabled?: boolean };
+    const body = await c.req.json();
+    const { enabled } = body as { enabled?: boolean };
     if (enabled === undefined) throw new BadRequestError("enabled is required");
 
-    await sendJsonRpc(ws, "setDCPowerState", { enabled });
+    await sendJsonRpc(c.env, device.id, "setDCPowerState", { enabled });
 
-    return res.status(204).send();
+    return c.body(null, 204);
   },
 );
 
@@ -598,13 +622,12 @@ redfishRouter.post(
 redfishRouter.get(
   "/v1/Managers/:id/Oem/JetKVM/ATXPower",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+  async (c) => {
+    const device = await getDeviceForRpc(c, c.req.param("id"));
 
-    const atxState = await sendJsonRpc(ws, "getATXState", {});
+    const atxState = (await sendJsonRpc(c.env, device.id, "getATXState", {})) as any;
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.JETKVM_ATX_POWER,
       "@odata.id": `/redfish/v1/Managers/${device.id}/Oem/JetKVM/ATXPower`,
       Id: "ATXPower",
@@ -629,11 +652,11 @@ redfishRouter.get(
 redfishRouter.post(
   "/v1/Managers/:id/Oem/JetKVM/ATXPower/Actions/SetPowerAction",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { device, ws } = await getDeviceForRpc(sub, req.params.id);
+  async (c) => {
+    const device = await getDeviceForRpc(c, c.req.param("id"));
 
-    const { action } = req.body as { action?: string };
+    const body = await c.req.json();
+    const { action } = body as { action?: string };
     if (!action) throw new BadRequestError("action is required");
 
     const allowed = ["power-short", "power-long", "reset"];
@@ -641,9 +664,9 @@ redfishRouter.post(
       throw new BadRequestError(`Unsupported action: ${action}. Allowed: ${allowed.join(", ")}`);
     }
 
-    await sendJsonRpc(ws, "setATXPowerAction", { action });
+    await sendJsonRpc(c.env, device.id, "setATXPowerAction", { action });
 
-    return res.status(204).send();
+    return c.body(null, 204);
   },
 );
 
@@ -651,11 +674,10 @@ redfishRouter.post(
 redfishRouter.get(
   "/v1/Chassis",
   redfishAuthenticated,
-  async (req: Request, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const devices = await getUserDevices(sub);
+  async (c) => {
+    const devices = await getUserDevices(c);
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.CHASSIS_COLLECTION,
       "@odata.id": "/redfish/v1/Chassis",
       Name: "Chassis Collection",
@@ -669,15 +691,20 @@ redfishRouter.get(
 redfishRouter.get(
   "/v1/Chassis/:id",
   redfishAuthenticated,
-  async (req: Request<{ id: string }>, res: Response) => {
-    const sub = (req as any).redfishSub as string;
-    const { id } = req.params;
-    const device = await getUserDevice(sub, id);
+  async (c) => {
+    const id = c.req.param("id");
+    const device = await getUserDevice(c, id);
     if (!device) throw new NotFoundError("Chassis not found");
 
-    const isOnline = activeConnections.has(device.id);
+    let isOnline = false;
+    try {
+      const status = await getDeviceStatus(c, device.id);
+      isOnline = status.online;
+    } catch {
+      // Device might not have a DO instance yet
+    }
 
-    return res.json({
+    return c.json({
       "@odata.type": ODATA.CHASSIS,
       "@odata.id": `/redfish/v1/Chassis/${device.id}`,
       Id: device.id,
