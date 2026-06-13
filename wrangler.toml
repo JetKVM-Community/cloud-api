@@ -1,0 +1,55 @@
+"$schema" = "./node_modules/wrangler/config-schema.json"
+name = "jetkvm-cloud-api"
+main = "src/index.ts"
+compatibility_date = "2026-02-10"
+compatibility_flags = ["nodejs_compat"]
+
+[dev]
+port = 3000
+
+# ---------------------------------------------------------------------------
+# Cloudflare R2 — firmware release storage
+# The R2_BUCKET binding gives native access to the bucket from Workers.
+# Artifacts are served publicly via R2_CDN_URL (set as a secret/env var).
+# ---------------------------------------------------------------------------
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "jetkvm-releases"
+
+# ---------------------------------------------------------------------------
+# Cloudflare D1 — serverless SQLite database
+# After `terraform apply`, set database_id from Terraform output:
+#   terraform -chdir=terraform output -raw d1_database_id
+# ---------------------------------------------------------------------------
+[[d1_databases]]
+binding = "DB"
+database_name = "jetkvm-cloud-api"
+database_id = "your-d1-database-id"
+migrations_dir = "prisma/migrations"
+
+# ---------------------------------------------------------------------------
+# Durable Object — per-device WebSocket signaling & state
+# ---------------------------------------------------------------------------
+[durable_objects]
+bindings = [
+  { name = "DEVICE_SIGNALING", class_name = "DeviceSignaling" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["DeviceSignaling"]
+
+# ---------------------------------------------------------------------------
+# Secrets (set via `wrangler secret put <NAME>`):
+#   OIDC_ISSUER             — OIDC issuer URL (e.g. https://<team>.cloudflareaccess.com)
+#   OIDC_CLIENT_ID          — OIDC client / application ID
+#   OIDC_CLIENT_SECRET      — OIDC client secret
+#   API_HOSTNAME            — Public hostname of this API (e.g. https://api.jetkvm.com)
+#   APP_HOSTNAME            — Frontend app hostname (e.g. https://app.jetkvm.com)
+#   COOKIE_SECRET           — HMAC-SHA256 key for signed session cookies
+#   CLOUDFLARE_TURN_ID      — Cloudflare Calls TURN key ID
+#   CLOUDFLARE_TURN_TOKEN   — Cloudflare Calls TURN API token
+#   R2_CDN_URL              — Public URL prefix for R2 assets (e.g. https://releases.jetkvm.com)
+#   CORS_ORIGINS            — Comma-separated allowed origins
+#   ALLOWED_IDENTITIES      — (optional) Comma-separated email allowlist
+# ---------------------------------------------------------------------------

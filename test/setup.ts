@@ -1,51 +1,243 @@
-import { beforeAll, afterAll, afterEach } from "vitest";
-import { mockClient } from "aws-sdk-client-mock";
-import { S3Client } from "@aws-sdk/client-s3";
-import { PrismaClient } from "@prisma/client";
-import { config } from "dotenv";
+import { beforeAll, afterEach, afterAll, vi } from "vitest";
 
-// Load .env.development for config
-config({ path: ".env.development" });
+// =========================================================================
+// Mock R2 Bucket
+// =========================================================================
 
-// Use compose.yaml database credentials (jetkvm user, not postgres)
-process.env.DATABASE_URL = "postgresql://jetkvm:jetkvm@localhost:5432/jetkvm?schema=public";
+export class MockR2Bucket {
+  private store = new Map<string, Uint8Array>();
 
-// Override S3 config for testing (mock responses)
-process.env.NODE_ENV = "test";
-process.env.R2_ENDPOINT = "https://test.r2.cloudflarestorage.com";
-process.env.R2_ACCESS_KEY_ID = "test-access-key";
-process.env.R2_SECRET_ACCESS_KEY = "test-secret-key";
-process.env.R2_BUCKET = "test-bucket";
-process.env.R2_CDN_URL = "https://cdn.test.com";
-
-// Create S3 mock that can be used across tests
-export const s3Mock = mockClient(S3Client);
-
-// Create a test Prisma client
-export const testPrisma = new PrismaClient();
-
-function ensureSafeTestDatabase() {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    throw new Error("DATABASE_URL is required for tests");
+  reset() {
+    this.store.clear();
   }
 
-  const parsed = new URL(databaseUrl);
-  const host = parsed.hostname;
-  const dbName = parsed.pathname.replace(/^\//, "");
+  putText(key: string, text: string) {
+    this.store.set(key, new TextEncoder().encode(text));
+  }
 
-  const isLocalHost = host === "localhost" || host === "127.0.0.1";
-  const isTestDb = dbName === "jetkvm" || dbName.includes("test");
+  putBinary(key: string, data: Uint8Array | ArrayBuffer) {
+    this.store.set(key, data instanceof Uint8Array ? data : new Uint8Array(data));
+  }
 
-  if (!isLocalHost || !isTestDb) {
-    throw new Error(
-      `Unsafe DATABASE_URL for tests: ${databaseUrl}. Refusing to run destructive test setup.`,
+  async list(
+    options?: { prefix?: string; delimiter?: string; limit?: number },
+  ): Promise<any> {
+    const prefix = options?.prefix ?? "";
+    const delimiter = options?.delimiter;
+    const limit = options?.limit ?? 1000;
+
+    const matchingKeys = [...this.store.keys()]
+      .filter((k) => k.startsWith(prefix))
+      .sort();
+
+    if (delimiter) {
+      const prefixSet = new Set<string>();
+      const objects: any[] = [];
+
+      for (const key of matchingKeys) {
+        const remainder = key.slice(prefix.length);
+        const delimIndex = remainder.indexOf(delimiter);
+        if (delimIndex >= 0) {
+          prefixSet.add(prefix + remainder.slice(0, delimIndex + 1));
+        } else {
+          objects.push({ key, size: this.store.get(key)!.byteLength });
+        }
+      }
+
+      return {
+        objects: objects.slice(0, limit),
+        delimitedPrefixes: [...prefixSet].sort(),
+        truncated: false,
+      };
+    }
+
+    return {
+      objects: matchingKeys
+        .slice(0, limit)
+        .map((key) => ({ key, size: this.store.get(key)!.byteLength })),
+      delimitedPrefixes: [],
+      truncated: false,
+    };
+  }
+
+  async get(key: string): Promise<any | null> {
+    const data = this.store.get(key);
+    if (!data) return null;
+
+    const buf = data.buffer.slice(
+      data.byteOffset,
+      data.byteOffset + data.byteLength,
     );
+
+    return {
+      key,
+      size: data.byteLength,
+      httpMetadata: {},
+      customMetadata: {},
+      text: async () => new TextDecoder().decode(data),
+      arrayBuffer: async () => buf,
+      json: async () => JSON.parse(new TextDecoder().decode(data)),
+      blob: async () => new Blob([new Uint8Array(data)]),
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new Uint8Array(data));
+          controller.close();
+        },
+      }),
+      bodyUsed: false,
+    };
+  }
+
+  async head(key: string): Promise<any | null> {
+    const data = this.store.get(key);
+    if (!data) return null;
+    return { key, size: data.byteLength };
+  }
+
+  async put(key: string, value: any): Promise<any> {
+    if (typeof value === "string") {
+      this.store.set(key, new TextEncoder().encode(value));
+    } else if (value instanceof ArrayBuffer) {
+      this.store.set(key, new Uint8Array(value));
+    } else if (value instanceof Uint8Array) {
+      this.store.set(key, value);
+    }
+    return { key };
+  }
+
+  async delete(keys: string | string[]): Promise<void> {
+    const keysArr = Array.isArray(keys) ? keys : [keys];
+    for (const key of keysArr) this.store.delete(key);
   }
 }
 
-// Seed data for releases
-export const seedReleases = [
+// =========================================================================
+// Mock Release Store (replaces real DB for release tests)
+// =========================================================================
+
+export interface MockRelease {
+  version: string;
+  type: string;
+  rolloutPercentage: number;
+  url: string;
+  hash: string;
+}
+
+export class MockReleaseStore {
+  releases: MockRelease[] = [];
+
+  reset() {
+    this.releases = [];
+  }
+
+  seed(data: MockRelease[]) {
+    this.releases = data.map((r) => ({ ...r }));
+  }
+
+  /** Returns a mock prisma-like object with release operations backed by this store. */
+  createPrismaMock(): any {
+    const self = this;
+    return {
+      release: {
+        findMany: vi.fn(async (args?: any) => {
+          let results = [...self.releases];
+          const where = args?.where;
+          if (where) {
+            if (where.rolloutPercentage !== undefined) {
+              results = results.filter(
+                (r) => r.rolloutPercentage === where.rolloutPercentage,
+              );
+            }
+            if (where.type !== undefined) {
+              results = results.filter((r) => r.type === where.type);
+            }
+          }
+          const select = args?.select;
+          if (select) {
+            return results.map((r) => {
+              const obj: any = {};
+              for (const key of Object.keys(select)) {
+                if (select[key]) obj[key] = (r as any)[key];
+              }
+              return obj;
+            });
+          }
+          return results;
+        }),
+
+        findUnique: vi.fn(async (args: any) => {
+          const where = args?.where;
+          if (where?.version_type) {
+            const { version, type } = where.version_type;
+            const found = self.releases.find(
+              (r) => r.version === version && r.type === type,
+            );
+            return found ? { ...found } : null;
+          }
+          return null;
+        }),
+
+        upsert: vi.fn(async (args: any) => {
+          const { version, type } = args.where.version_type;
+          let existing = self.releases.find(
+            (r) => r.version === version && r.type === type,
+          );
+
+          if (existing) {
+            if (args.update && Object.keys(args.update).length > 0) {
+              Object.assign(existing, args.update);
+            }
+          } else {
+            existing = { ...args.create };
+            self.releases.push(existing!);
+          }
+
+          const select = args?.select;
+          if (select) {
+            const obj: any = {};
+            for (const key of Object.keys(select)) {
+              if (select[key]) obj[key] = (existing as any)[key];
+            }
+            return obj;
+          }
+          return { ...existing };
+        }),
+
+        create: vi.fn(async (args: any) => {
+          const data = { ...args.data };
+          self.releases.push(data);
+          return data;
+        }),
+
+        deleteMany: vi.fn(async (args?: any) => {
+          const where = args?.where;
+          if (!where || Object.keys(where).length === 0) {
+            const count = self.releases.length;
+            self.releases = [];
+            return { count };
+          }
+          if (where.version) {
+            const before = self.releases.length;
+            self.releases = self.releases.filter(
+              (r) => r.version !== where.version,
+            );
+            return { count: before - self.releases.length };
+          }
+          return { count: 0 };
+        }),
+      },
+    };
+  }
+}
+
+// =========================================================================
+// Shared instances & seed data
+// =========================================================================
+
+export const mockBucket = new MockR2Bucket();
+export const releaseStore = new MockReleaseStore();
+
+export const seedReleases: MockRelease[] = [
   // App releases
   {
     version: "1.0.0",
@@ -92,90 +284,44 @@ export const seedReleases = [
   },
 ];
 
-// Helper to set rollout percentage for a specific version
-export async function setRollout(version: string, type: "app" | "system", percentage: number) {
-  await testPrisma.release.upsert({
-    where: { version_type: { version, type } },
-    update: { rolloutPercentage: percentage },
-    create: {
+export async function setRollout(
+  version: string,
+  type: "app" | "system",
+  percentage: number,
+) {
+  const existing = releaseStore.releases.find(
+    (r) => r.version === version && r.type === type,
+  );
+  if (existing) {
+    existing.rolloutPercentage = percentage;
+  } else {
+    releaseStore.releases.push({
       version,
       type,
       rolloutPercentage: percentage,
       url: `https://cdn.test.com/${type}/${version}/${type === "app" ? "jetkvm_app" : "system.tar"}`,
       hash: `test-hash-${version}-${type}`,
-    },
-  });
-}
-
-// Helper to reset all releases to seed data baseline
-export async function resetToSeedData() {
-  // Delete any releases not in seed data
-  const seedVersionTypes = seedReleases.map(r => ({ version: r.version, type: r.type }));
-  await testPrisma.release.deleteMany({
-    where: {
-      NOT: {
-        OR: seedVersionTypes.map(vt => ({
-          version: vt.version,
-          type: vt.type,
-        })),
-      },
-    },
-  });
-
-  // Reset seed releases to original values
-  for (const release of seedReleases) {
-    await testPrisma.release.upsert({
-      where: { version_type: { version: release.version, type: release.type } },
-      update: { rolloutPercentage: release.rolloutPercentage, url: release.url, hash: release.hash },
-      create: release,
     });
   }
 }
 
-// Helper to create a readable stream from a string (for S3 mock responses)
-export function createMockStream(content: string): ReadableStream<Uint8Array> {
-  return new ReadableStream({
-    start(controller) {
-      controller.enqueue(new TextEncoder().encode(content));
-      controller.close();
-    },
-  });
+export async function resetToSeedData() {
+  releaseStore.seed(seedReleases);
 }
 
-// Helper to create async iterable from string (for streamToString/streamToBuffer)
-export function createAsyncIterable(content: string | Buffer) {
-  const data = typeof content === "string" ? Buffer.from(content) : content;
-  return {
-    async *[Symbol.asyncIterator]() {
-      yield data;
-    },
-  };
-}
+// =========================================================================
+// Global hooks
+// =========================================================================
 
 beforeAll(async () => {
-  ensureSafeTestDatabase();
-
-  // Connect to the test database
-  await testPrisma.$connect();
-
-  // Clean up existing releases
-  await testPrisma.release.deleteMany({});
-
-  // Seed the database with test releases
-  for (const release of seedReleases) {
-    await testPrisma.release.create({ data: release });
-  }
+  releaseStore.seed(seedReleases);
 });
 
 afterEach(() => {
-  // Reset S3 mock after each test
-  s3Mock.reset();
-  // Reset DB to seed state after each test to avoid cross-test coupling
+  mockBucket.reset();
   return resetToSeedData();
 });
 
-afterAll(async () => {
-  // Clean up after all tests
-  await testPrisma.release.deleteMany({});
-  await testPrisma.$disconnect();
+afterAll(() => {
+  // Nothing to clean up with in-memory stores
 });

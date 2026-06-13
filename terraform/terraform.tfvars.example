@@ -1,0 +1,50 @@
+# =============================================================================
+# Example Terraform variable values — copy to terraform.tfvars and fill in.
+# DO NOT commit terraform.tfvars (it contains secrets).
+# =============================================================================
+
+cloudflare_api_token  = ""
+cloudflare_account_id = ""
+cloudflare_zone_id    = ""
+
+# ── Worker ───────────────────────────────────────────────────────────────────
+worker_name = "jetkvm-cloud-api"
+
+# ── D1 ───────────────────────────────────────────────────────────────────────
+d1_database_name = "jetkvm-cloud-api"
+
+# ── R2 ───────────────────────────────────────────────────────────────────────
+r2_bucket_name     = "jetkvm-releases"
+r2_bucket_location = "wnam"
+
+# ── Custom Domain (leave empty to skip) ──────────────────────────────────────
+api_hostname = "api.jetkvm.com"
+app_hostname = "app.jetkvm.com"
+
+# ── R2 CDN DNS (leave empty to skip) ─────────────────────────────────────────
+r2_cdn_hostname     = "releases.jetkvm.com"
+r2_cdn_cname_target = ""
+
+# ── Zero Trust Access ────────────────────────────────────────────────────────
+enable_access          = false
+access_idp_name        = "JetKVM OIDC"
+access_session_duration = "24h"
+
+# ── OIDC (required when enable_access = true) ────────────────────────────────
+oidc_issuer        = "https://your-team.cloudflareaccess.com"
+oidc_client_id     = ""
+oidc_client_secret = ""
+
+# ── Worker Secrets ────────────────────────────────────────────────────────────
+cookie_secret         = ""
+cloudflare_turn_id    = ""
+cloudflare_turn_token = ""
+
+# ── Worker Environment ───────────────────────────────────────────────────────
+r2_cdn_url          = "https://releases.jetkvm.com"
+cors_origins        = "https://app.jetkvm.com"
+allowed_identities  = ""
+
+# ── Worker Build / Deploy ────────────────────────────────────────────────────
+worker_dist_dir        = "../dist"
+worker_version_message = "Deployed via Terraform"

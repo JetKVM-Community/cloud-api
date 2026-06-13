@@ -1,150 +1,248 @@
-import { generators, Issuer } from "openid-client";
-import express from "express";
-import { prisma } from "./db";
+import type { Context } from "hono";
+import type { AppType } from "./env";
 import { BadRequestError, UnauthorizedError } from "./errors";
-import { isIdentityAllowed } from "./auth";
-import * as crypto from "crypto";
+import { isIdentityAllowed, getAllowedIdentities } from "./auth";
+import { randomHex } from "./helpers";
 
-const API_HOSTNAME = process.env.API_HOSTNAME;
-const APP_HOSTNAME = process.env.APP_HOSTNAME;
-const REDIRECT_URI = `${API_HOSTNAME}/oidc/callback`;
+// ---------------------------------------------------------------------------
+// Generic OIDC Discovery
+// ---------------------------------------------------------------------------
+interface OidcConfig {
+  authorization_endpoint: string;
+  token_endpoint: string;
+  userinfo_endpoint: string;
+}
 
-const getGoogleOIDCClient = async () => {
-  const googleIssuer = await Issuer.discover("https://accounts.google.com");
-  return new googleIssuer.Client({
-    client_id: process.env.GOOGLE_CLIENT_ID,
-    client_secret: process.env.GOOGLE_CLIENT_SECRET,
-    redirect_uris: [REDIRECT_URI],
-    response_types: ["code"],
-  });
-};
+let cachedOidcConfig: OidcConfig | null = null;
 
-export const Google = async (req: express.Request, res: express.Response) => {
+async function getOidcConfig(issuer: string): Promise<OidcConfig> {
+  if (cachedOidcConfig) return cachedOidcConfig;
+  const url = `${issuer.replace(/\/+$/, "")}/.well-known/openid-configuration`;
+  const resp = await fetch(url);
+  cachedOidcConfig = (await resp.json()) as OidcConfig;
+  return cachedOidcConfig;
+}
+
+// ---------------------------------------------------------------------------
+// PKCE helpers (Web Crypto)
+// ---------------------------------------------------------------------------
+function base64url(buffer: Uint8Array): string {
+  const base64 = btoa(String.fromCharCode(...buffer));
+  return base64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function generateCodeVerifier(): string {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return base64url(bytes);
+}
+
+async function generateCodeChallenge(verifier: string): Promise<string> {
+  const data = new TextEncoder().encode(verifier);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return base64url(new Uint8Array(hash));
+}
+
+function generateState(): string {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return base64url(bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Route Handlers
+// ---------------------------------------------------------------------------
+
+/**
+ * POST /oidc/login — initiate OIDC login flow.
+ * Sets session state and redirects to the provider's authorization endpoint.
+ */
+export const Login = async (c: Context<AppType>) => {
+  const body = await c.req.json().catch(() => ({})) as {
+    deviceId?: string;
+    returnTo?: string;
+  };
+
+  const session = c.get("session");
+  const config = await getOidcConfig(c.env.OIDC_ISSUER);
+
+  // Generate CSRF state
+  const csrf = generateState();
+  session.csrf = csrf;
+  session.deviceId = body.deviceId;
+  session.returnTo = body.returnTo;
+
+  // Generate PKCE
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = await generateCodeChallenge(codeVerifier);
+  session.code_verifier = codeVerifier;
+
+  c.set("session", session);
+
+  const redirectUri = `${c.env.API_HOSTNAME}/oidc/callback`;
+
   const state = new URLSearchParams();
+  state.set("csrf", csrf);
 
-  // Generate a CSRF token and store it in the session, so the callback
-  // can ensure that the request is the same as the one that was initiated.
-  state.set("csrf", generators.state());
-  req.session!.csrf = state.get("csrf");
+  const authUrl = new URL(config.authorization_endpoint);
+  authUrl.searchParams.set("client_id", c.env.OIDC_CLIENT_ID);
+  authUrl.searchParams.set("redirect_uri", redirectUri);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("scope", "openid email profile");
+  authUrl.searchParams.set("state", state.toString());
+  authUrl.searchParams.set("code_challenge", codeChallenge);
+  authUrl.searchParams.set("code_challenge_method", "S256");
 
-  req.session!.deviceId = req.body.deviceId;
-  req.session!.returnTo = req.body.returnTo;
-
-  const code_verifier = generators.codeVerifier();
-  const code_challenge = generators.codeChallenge(code_verifier);
-  req.session!.code_verifier = code_verifier;
-
-  const client = await getGoogleOIDCClient();
-  const authorizationUrl = client.authorizationUrl({
-    scope: "openid email profile",
-    state: state.toString(),
-    // This ensures that to even issue the token, the client must have the code_verifier,
-    // which is stored in the session cookie.
-    code_challenge,
-    code_challenge_method: "S256",
-  });
-  return res.redirect(authorizationUrl);
+  return c.redirect(authUrl.toString());
 };
 
-export const Callback = async (req: express.Request, res: express.Response) => {
-  const client = await getGoogleOIDCClient();
+/**
+ * GET /oidc/callback_o — the real OIDC callback handler.
+ * Exchanges the authorization code for tokens, creates user in DB.
+ */
+export const Callback = async (c: Context<AppType>) => {
+  const config = await getOidcConfig(c.env.OIDC_ISSUER);
+  const session = c.get("session");
+  const prisma = c.get("prisma");
 
-  // Retrieve recognized callback parameters from the request, e.g. code and state
-  const params = client.callbackParams(req);
-  if (!params)
-    throw new BadRequestError("Missing callback parameters", "missing_callback_params");
+  const url = new URL(c.req.url);
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
 
-  const sessionCsrf = req.session?.csrf;
+  if (!code) {
+    throw new BadRequestError(
+      "Missing callback parameters",
+      "missing_callback_params",
+    );
+  }
+
+  const sessionCsrf = session.csrf;
   if (!sessionCsrf) {
     throw new BadRequestError("Missing CSRF in session", "missing_csrf");
   }
 
-  const thisRequestCsrf = new URLSearchParams(params.state).get("csrf");
+  const thisRequestCsrf = state
+    ? new URLSearchParams(state).get("csrf")
+    : null;
   if (thisRequestCsrf !== sessionCsrf) {
     throw new BadRequestError("Invalid CSRF", "invalid_csrf");
   }
 
-  const deviceId = req.session?.deviceId as string | undefined;
-  const returnTo = (req.session?.returnTo ?? `${APP_HOSTNAME}/devices`) as string;
+  const deviceId = session.deviceId;
+  const returnTo = session.returnTo ?? `${c.env.APP_HOSTNAME}/devices`;
 
-  req.session!.csrf = null;
-  req.session!.returnTo = null;
-  req.session!.deviceId = null;
+  // Clear temporary session data
+  session.csrf = undefined;
+  session.returnTo = undefined;
+  session.deviceId = undefined;
 
-  // Exchange code for access token and ID token
-  const tokenSet = await client.callback(REDIRECT_URI, params, {
-    state: req.query.state?.toString(),
-    code_verifier: req.session?.code_verifier,
+  const redirectUri = `${c.env.API_HOSTNAME}/oidc/callback`;
+
+  // Exchange code for tokens
+  const tokenResp = await fetch(config.token_endpoint, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      client_id: c.env.OIDC_CLIENT_ID,
+      client_secret: c.env.OIDC_CLIENT_SECRET,
+      code_verifier: session.code_verifier || "",
+    }),
   });
 
-  const userInfo = await client.userinfo(tokenSet);
-
-  // TokenClaims is an object that contains the sub, email, name and other claims
-  const tokenClaims = tokenSet.claims();
-  if (!tokenClaims) {
-    throw new BadRequestError("Missing claims in token", "missing_claims");
+  if (!tokenResp.ok) {
+    const errorBody = await tokenResp.text();
+    console.error("Token exchange failed:", errorBody);
+    throw new BadRequestError("Token exchange failed", "token_exchange_failed");
   }
+
+  const tokenSet = (await tokenResp.json()) as {
+    id_token?: string;
+    access_token?: string;
+  };
 
   if (!tokenSet.id_token) {
     throw new BadRequestError("Missing ID Token", "missing_id_token");
   }
 
+  // Get user info
+  const userinfoResp = await fetch(config.userinfo_endpoint, {
+    headers: { Authorization: `Bearer ${tokenSet.access_token}` },
+  });
+
+  const userInfo = (await userinfoResp.json()) as {
+    sub?: string;
+    email?: string;
+    picture?: string;
+  };
+
   if (!userInfo.email) {
-    req.session = null;
-    throw new BadRequestError("Missing email claim in user info", "missing_email_claim");
-  }
-  if (!isIdentityAllowed(userInfo.email)) {
-    req.session = null;
-    throw new UnauthorizedError("Account is not in the allowlist", "account_not_allowed");
+    c.set("session", {} as any);
+    throw new BadRequestError(
+      "Missing email claim in user info",
+      "missing_email_claim",
+    );
   }
 
-  req.session!.id_token = tokenSet.id_token;
+  const allowedIdentities = getAllowedIdentities(c.env.ALLOWED_IDENTITIES);
+  if (!isIdentityAllowed(userInfo.email, allowedIdentities)) {
+    c.set("session", {} as any);
+    throw new UnauthorizedError(
+      "Account is not in the allowlist",
+      "account_not_allowed",
+    );
+  }
+
+  // Decode token claims
+  const [, payloadB64] = tokenSet.id_token.split(".");
+  const claimsJson = new TextDecoder().decode(
+    Uint8Array.from(
+      atob(payloadB64.replace(/-/g, "+").replace(/_/g, "/")),
+      (ch) => ch.charCodeAt(0),
+    ),
+  );
+  const tokenClaims = JSON.parse(claimsJson) as { sub: string };
+
+  session.id_token = tokenSet.id_token;
+  session.code_verifier = undefined;
+  c.set("session", session);
 
   await prisma.user.upsert({
-    where: { googleId: tokenClaims.sub },
+    where: { oidcId: tokenClaims.sub },
     update: {
-      googleId: tokenClaims.sub,
+      oidcId: tokenClaims.sub,
       email: userInfo.email,
       picture: userInfo.picture,
     },
     create: {
-      googleId: tokenClaims.sub,
+      oidcId: tokenClaims.sub,
       email: userInfo.email,
       picture: userInfo.picture,
     },
   });
 
-  // This means the user is trying to adopt a device by first logging/signin up/in
+  // Handle device adoption flow
   if (deviceId) {
     const deviceAdopted = await prisma.device.findUnique({
       where: { id: deviceId },
-      select: { user: { select: { googleId: true } } },
+      select: { user: { select: { oidcId: true } } },
     });
 
-
-    const isAdoptedByCurrentUser = deviceAdopted?.user.googleId === tokenClaims.sub;
+    const isAdoptedByCurrentUser =
+      deviceAdopted?.user.oidcId === tokenClaims.sub;
     const isAdoptedByOther = deviceAdopted && !isAdoptedByCurrentUser;
+
     if (isAdoptedByOther) {
-      // Device is already adopted by another user. This can happen if:
-      // 1. The device was resold without being de-registered by the previous owner.
-      // 2. Someone is trying to adopt a device they don't own.
-      //
-      // Security note:
-      // The previous owner can't connect to the device anymore because:
-      // - The device would have done a hardware reset, erasing its deviceToken.
-      // - Without a valid deviceToken, the device can't connect to the cloud API.
-      //
-      // This check prevents unauthorized adoption and ensures proper ownership transfer.
-      // The cost of this check is therefore, that the previous owner has to re-register the device.
-      return res.redirect(`${APP_HOSTNAME}/already-adopted`);
+      return c.redirect(`${c.env.APP_HOSTNAME}/already-adopted`);
     }
 
-    // Temp Token expires in 5 minutes
-    const tempToken = crypto.randomBytes(20).toString("hex");
-    const tempTokenExpiresAt = new Date(new Date().getTime() + 5 * 60000);
+    const tempToken = randomHex(20);
+    const tempTokenExpiresAt = new Date(Date.now() + 5 * 60000);
 
     await prisma.user.update({
-      where: { googleId: tokenClaims.sub },
+      where: { oidcId: tokenClaims.sub },
       data: {
         device: {
           upsert: {
@@ -158,12 +256,52 @@ export const Callback = async (req: express.Request, res: express.Response) => {
 
     console.log("Adopted device", deviceId, "for user", tokenClaims.sub);
 
-    const url = new URL(returnTo);
-    url.searchParams.append("tempToken", tempToken);
-    url.searchParams.append("deviceId", deviceId);
-    url.searchParams.append("oidcGoogle", tokenSet.id_token.toString());
-    url.searchParams.append("clientId", process.env.GOOGLE_CLIENT_ID);
-    return res.redirect(url.toString());
+    const returnUrl = new URL(returnTo);
+    returnUrl.searchParams.append("tempToken", tempToken);
+    returnUrl.searchParams.append("deviceId", deviceId);
+    returnUrl.searchParams.append("oidcIdToken", tokenSet.id_token);
+    returnUrl.searchParams.append("clientId", c.env.OIDC_CLIENT_ID);
+    return c.redirect(returnUrl.toString());
   }
-  return res.redirect(returnTo);
+
+  return c.redirect(returnTo);
 };
+
+/**
+ * GET /oidc/callback — intermediate redirect to work around
+ * SameSite=Strict cookie restrictions on OIDC redirects.
+ */
+export const CallbackIntermediate = (c: Context<AppType>) => {
+  const url = new URL(c.req.url);
+  const callbackUrl =
+    url.pathname.replace("/oidc/callback", "/oidc/callback_o") +
+    url.search;
+
+  return c.html(
+    `<html>
+      <head>
+        <meta http-equiv="refresh" content="0; URL='${callbackUrl}'"/>
+        <script>
+          document.documentElement.classList.toggle(
+            "dark",
+            localStorage.theme === "dark" ||
+              (!("theme" in localStorage) &&
+                window.matchMedia("(prefers-color-scheme: dark)").matches),
+          );
+          window
+            .matchMedia("(prefers-color-scheme: dark)")
+            .addEventListener("change", ({ matches }) => {
+              if (!("theme" in localStorage)) {
+                document.documentElement.classList.toggle("dark", matches);
+              }
+            });
+        </script>
+        <style>
+          body {background-color: #0f172a;}
+        </style>
+      </head>
+      <body></body>
+    </html>`,
+  );
+};
+

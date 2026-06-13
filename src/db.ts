@@ -1,25 +1,14 @@
-import { PrismaClient } from "@prisma/client";
+import { PrismaD1 } from "@prisma/adapter-d1";
+import { PrismaClient } from './generated/prisma/';
 
-let prismaClient: PrismaClient;
-declare global {
-  var __db: PrismaClient | undefined;
+/**
+ * Creates a PrismaClient connected to Cloudflare D1.
+ *
+ * D1 is Cloudflare's serverless SQL database built on SQLite.
+ * A new PrismaClient is created per request using the D1 binding.
+ */
+export function createPrisma(db: D1Database): PrismaClient {
+  const adapter = new PrismaD1(db);
+  return new PrismaClient({ adapter });
 }
 
-// This is needed because in development we don't want to restart
-// the server with every change, but we want to make sure we don't
-// create a new connection to the DB with every change either.
-if (process.env.NODE_ENV !== "development") {
-  prismaClient = new PrismaClient();
-  prismaClient.$connect();
-} else {
-  if (!global.__db) {
-    global.__db = new PrismaClient();
-    global.__db.$connect();
-  }
-  prismaClient = global.__db;
-}
-
-
-// Have to cast it manually, because webstorm can't infer it for some reason
-// https://github.com/prisma/prisma/issues/2359#issuecomment-963340538
-export const prisma = prismaClient;
