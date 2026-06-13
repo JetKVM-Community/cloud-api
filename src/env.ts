@@ -1,4 +1,4 @@
-import type { PrismaClient } from "@prisma/client/edge";
+import { PrismaClient } from './generated/prisma/';
 
 export type Env = {
   // Cloudflare Bindings

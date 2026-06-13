@@ -1,6 +1,7 @@
+"$schema" = "./node_modules/wrangler/config-schema.json"
 name = "jetkvm-cloud-api"
 main = "src/index.ts"
-compatibility_date = "2025-01-01"
+compatibility_date = "2026-02-10"
 compatibility_flags = ["nodejs_compat"]
 
 [dev]
@@ -17,6 +18,8 @@ bucket_name = "jetkvm-releases"
 
 # ---------------------------------------------------------------------------
 # Cloudflare D1 — serverless SQLite database
+# After `terraform apply`, set database_id from Terraform output:
+#   terraform -chdir=terraform output -raw d1_database_id
 # ---------------------------------------------------------------------------
 [[d1_databases]]
 binding = "DB"

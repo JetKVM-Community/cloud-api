@@ -20,12 +20,11 @@
   "author": "JetKVM",
   "license": "GPL-2.0",
   "dependencies": {
-    "@prisma/adapter-d1": "^5.13.0",
-    "@prisma/client": "^5.13.0",
+    "@prisma/adapter-d1": "^6.19.2",
+    "@prisma/client": "^6.19.2",
     "hono": "^4.6.0",
     "jose": "^5.2.4",
     "lru-cache": "^11.2.2",
-    "prisma": "^5.13.0",
     "semver": "^7.6.3",
     "typescript": "^5.4.5",
     "zod": "^4.3.6"
@@ -35,7 +34,8 @@
     "@types/semver": "^7.5.8",
     "@vitest/coverage-v8": "^4.0.18",
     "prettier": "3.2.5",
+    "prisma": "^6.19.2",
     "vitest": "^4.0.18",
-    "wrangler": "^3.100.0"
+    "wrangler": "^4.64.0"
   }
 }

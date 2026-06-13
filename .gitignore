@@ -3,3 +3,18 @@ node_modules
 dist/
 .env
 .env.development
+.dev.vars
+
+# Prisma generated client (regenerated via `npx prisma generate`)
+src/generated/
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/terraform.tfvars
+terraform/.terraform.tfstate.lock.info
+
+.wrangler
+terraform.auto.tfvars

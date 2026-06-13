@@ -1,5 +1,5 @@
 import { PrismaD1 } from "@prisma/adapter-d1";
-import { PrismaClient } from "@prisma/client";
+import { PrismaClient } from './generated/prisma/';
 
 /**
  * Creates a PrismaClient connected to Cloudflare D1.
@@ -9,6 +9,6 @@ import { PrismaClient } from "@prisma/client";
  */
 export function createPrisma(db: D1Database): PrismaClient {
   const adapter = new PrismaD1(db);
-  return new PrismaClient({ adapter: adapter as any });
+  return new PrismaClient({ adapter });
 }
 
