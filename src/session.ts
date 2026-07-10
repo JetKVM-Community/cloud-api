@@ -93,6 +93,7 @@ export function sessionMiddleware(): MiddlewareHandler<AppType> {
     // Read session from cookie
     const sessionCookie = getCookie(c, "session");
     const sigCookie = getCookie(c, "session.sig");
+    const hadSessionCookie = Boolean(sessionCookie && sigCookie);
 
     let session: SessionData = {};
 
@@ -118,6 +119,15 @@ export function sessionMiddleware(): MiddlewareHandler<AppType> {
 
     await next();
 
+    // A WebSocket upgrade (101) carries a `webSocket` and cannot be rebuilt:
+    // `new Response(body, { status: 101 })` throws RangeError (valid range is
+    // 200–599). Set-Cookie on a 101 is meaningless anyway, so leave it untouched.
+    // The client signaling upgrade is authenticated by cookie and so reaches
+    // here with a populated session; without this guard it 500s.
+    if (c.res.status === 101 || c.res.webSocket) {
+      return;
+    }
+
     // After handler, write updated session to cookies
     const updatedSession = c.get("session");
     const cookieOpts = {
@@ -142,6 +152,14 @@ export function sessionMiddleware(): MiddlewareHandler<AppType> {
         statusText: c.res.statusText,
         headers,
       });
+    } else if (!hadSessionCookie && Object.keys(updatedSession).length === 0) {
+      // Nothing to persist, and nothing arrived. Do NOT write an empty session:
+      // a cross-site navigation withholds the SameSite=Strict cookie, so a
+      // session the browser still holds looks absent here. That is exactly what
+      // GET /oidc/callback is — the hop back from the identity provider — and
+      // writing `{}` would clobber the CSRF token that /oidc/callback_o then
+      // fails to find. See CallbackIntermediate in oidc.ts.
+      return;
     } else {
       const json = JSON.stringify(updatedSession);
       const encoded = base64url(new TextEncoder().encode(json));

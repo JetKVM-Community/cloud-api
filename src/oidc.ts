@@ -49,19 +49,69 @@ function generateState(): string {
   return base64url(bytes);
 }
 
+/**
+ * Builds the URL the browser is sent back to after adopting a device.
+ *
+ * The ID token is emitted twice, under two names. `oidcIdToken` is the current
+ * name; `oidcGoogle` is the legacy one the device UI still reads
+ * (ui/src/routes/adopt.tsx), which then POSTs it to the device's own
+ * /cloud/register. Sending only `oidcIdToken` leaves that field null and the
+ * device answers 400 {"error":"Invalid OIDC token"}.
+ */
+export function buildAdoptReturnUrl(
+  returnTo: string,
+  params: {
+    tempToken: string;
+    deviceId: string;
+    idToken: string;
+    clientId: string;
+  },
+): string {
+  const url = new URL(returnTo);
+  url.searchParams.append("tempToken", params.tempToken);
+  url.searchParams.append("deviceId", params.deviceId);
+  url.searchParams.append("oidcIdToken", params.idToken);
+  url.searchParams.append("oidcGoogle", params.idToken);
+  url.searchParams.append("clientId", params.clientId);
+  return url.toString();
+}
+
 // ---------------------------------------------------------------------------
 // Route Handlers
 // ---------------------------------------------------------------------------
 
+interface LoginBody {
+  deviceId?: string;
+  returnTo?: string;
+}
+
+/**
+ * Reads the login parameters from either a JSON body or a form submission.
+ *
+ * The legacy /oidc/google endpoint is targeted by a native <form method="POST">
+ * in the UI, so it arrives urlencoded rather than as JSON. parseBody also yields
+ * File values for multipart bodies; only strings are meaningful here.
+ */
+async function readLoginBody(c: Context<AppType>): Promise<LoginBody> {
+  const contentType = c.req.header("content-type") ?? "";
+
+  const raw: Record<string, unknown> = contentType.includes("application/json")
+    ? await c.req.json().catch(() => ({}))
+    : await c.req.parseBody().catch(() => ({}));
+
+  const str = (value: unknown) =>
+    typeof value === "string" && value.length > 0 ? value : undefined;
+
+  return { deviceId: str(raw.deviceId), returnTo: str(raw.returnTo) };
+}
+
 /**
  * POST /oidc/login — initiate OIDC login flow.
+ * Also mounted at POST /oidc/google, the legacy endpoint the default UI posts to.
  * Sets session state and redirects to the provider's authorization endpoint.
  */
 export const Login = async (c: Context<AppType>) => {
-  const body = await c.req.json().catch(() => ({})) as {
-    deviceId?: string;
-    returnTo?: string;
-  };
+  const body = await readLoginBody(c);
 
   const session = c.get("session");
   const config = await getOidcConfig(c.env.OIDC_ISSUER);
@@ -256,12 +306,13 @@ export const Callback = async (c: Context<AppType>) => {
 
     console.log("Adopted device", deviceId, "for user", tokenClaims.sub);
 
-    const returnUrl = new URL(returnTo);
-    returnUrl.searchParams.append("tempToken", tempToken);
-    returnUrl.searchParams.append("deviceId", deviceId);
-    returnUrl.searchParams.append("oidcIdToken", tokenSet.id_token);
-    returnUrl.searchParams.append("clientId", c.env.OIDC_CLIENT_ID);
-    return c.redirect(returnUrl.toString());
+    const returnUrl = buildAdoptReturnUrl(returnTo, {
+      tempToken,
+      deviceId,
+      idToken: tokenSet.id_token,
+      clientId: c.env.OIDC_CLIENT_ID,
+    });
+    return c.redirect(returnUrl);
   }
 
   return c.redirect(returnTo);

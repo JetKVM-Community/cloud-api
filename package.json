@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "d1-migrate": "bash ./scripts/d1-migrate.sh"
   },
   "keywords": [],
   "author": "JetKVM",

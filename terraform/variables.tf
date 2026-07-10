@@ -24,6 +24,12 @@ variable "worker_name" {
   default     = "jetkvm-cloud-api"
 }
 
+variable "workers_dev_subdomain" {
+  description = "The account's workers.dev subdomain (e.g. \"acme\" for acme.workers.dev). Only used to render worker_subdomain_url; the API exposes no data source for it."
+  type        = string
+  default     = ""
+}
+
 variable "d1_database_name" {
   description = "Name of the D1 database."
   type        = string
@@ -169,6 +175,12 @@ variable "turn_app_name" {
   default     = "jetkvm-cloud-api"
 }
 
+variable "create_turn_key" {
+  description = "Mint a new Cloudflare Calls TURN key via POST. Set true for exactly one apply, then back to false — the data source re-POSTs on every read and would otherwise mint a key each plan. See turn.tf."
+  type        = bool
+  default     = false
+}
+
 # -----------------------------------------------------------------------------
 # Worker build / deploy
 # -----------------------------------------------------------------------------
@@ -177,6 +189,24 @@ variable "worker_dist_dir" {
   description = "Path to the compiled Worker output directory (relative to terraform/)."
   type        = string
   default     = "../dist"
+}
+
+variable "app_worker_name" {
+  description = "Name of the static-assets Worker serving the UI."
+  type        = string
+  default     = "jetkvm-cloud-app"
+}
+
+variable "app_dist_dir" {
+  description = "Path to the built JetKVM UI bundle (relative to terraform/). See app.tf."
+  type        = string
+  default     = "../dist-ui"
+}
+
+variable "app_version_message" {
+  description = "Human-readable annotation for the deployed UI version."
+  type        = string
+  default     = "UI bundle deployed via Terraform"
 }
 
 variable "worker_version_message" {

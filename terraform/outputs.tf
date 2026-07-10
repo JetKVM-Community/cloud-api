@@ -28,8 +28,12 @@ output "worker_name" {
 }
 
 output "worker_subdomain_url" {
-  description = "Workers.dev URL for the deployed Worker."
-  value       = "https://${cloudflare_worker.api.name}.${local.account_id}.workers.dev"
+  description = "Workers.dev URL for the deployed Worker, or null when workers_dev_subdomain is unset."
+  value = (
+    var.workers_dev_subdomain != ""
+    ? "https://${cloudflare_worker.api.name}.${var.workers_dev_subdomain}.workers.dev"
+    : null
+  )
 }
 
 output "worker_version_id" {
@@ -72,17 +76,46 @@ output "oidc_client_secret" {
 # -----------------------------------------------------------------------------
 
 output "turn_key_id" {
-  description = "Cloudflare Calls TURN key ID (CLOUDFLARE_TURN_ID)."
-  value       = cloudflare_calls_turn_app.webrtc.uid
+  description = "Cloudflare Calls TURN key ID (CLOUDFLARE_TURN_ID), latched at creation. See turn.tf."
+  value       = terraform_data.turn_key.output.uid
 }
 
 output "turn_key_token" {
-  description = "Cloudflare Calls TURN bearer token (CLOUDFLARE_TURN_TOKEN)."
-  value       = cloudflare_calls_turn_app.webrtc.key
+  description = "Cloudflare Calls TURN bearer token (CLOUDFLARE_TURN_TOKEN), latched at creation."
+  value       = terraform_data.turn_key.output.secret
   sensitive   = true
 }
 
 output "r2_cdn_url" {
   description = "Public URL prefix serving R2 release artifacts, or \"\" when no custom domain is configured."
   value       = local.r2_cdn_url
+}
+
+output "api_url" {
+  description = "Public URL of the Worker custom domain, or \"\" when api_hostname is unset."
+  value       = local.api_url
+}
+
+output "worker_custom_domain_id" {
+  description = "ID of the Worker custom domain attachment."
+  value       = one(cloudflare_workers_custom_domain.api[*].id)
+}
+
+# -----------------------------------------------------------------------------
+# Static UI app
+# -----------------------------------------------------------------------------
+
+output "app_worker_name" {
+  description = "Name of the static-assets Worker serving the UI."
+  value       = cloudflare_worker.app.name
+}
+
+output "app_url" {
+  description = "Public URL of the UI app, or \"\" when app_hostname is unset."
+  value       = local.app_url
+}
+
+output "app_version_id" {
+  description = "ID of the deployed UI Worker version."
+  value       = cloudflare_worker_version.app.id
 }

@@ -111,6 +111,15 @@ export class DeviceSignaling extends DurableObject<Env> {
 
     this.ctx.acceptWebSocket(server, ["client"]);
 
+    // Persist the authenticated client's OIDC token on the socket so it survives
+    // hibernation and can be stamped onto SDP offers relayed to the device. The
+    // Worker passes it via X-Oidc-Token (see index.ts). The device re-verifies
+    // it against Google on every cloud session and won't answer without it.
+    const oidcToken = request.headers.get("X-Oidc-Token");
+    if (oidcToken) {
+      server.serializeAttachment({ oidcToken });
+    }
+
     // Send device metadata to client
     const version = await this.ctx.storage.get("deviceVersion");
     server.send(
@@ -443,7 +452,14 @@ export class DeviceSignaling extends DurableObject<Env> {
       const msg = JSON.parse(msgStr);
 
       switch (msg.type) {
-        case "offer":
+        case "offer": {
+          // The browser sends only { sd }; the OIDC token comes from the socket
+          // attachment set at upgrade (see handleClientUpgrade). Fall back to a
+          // token in the message for any client that does send one.
+          const attachment = clientWs.deserializeAttachment() as
+            | { oidcToken?: string }
+            | null;
+          const oidcGoogle = msg.data?.oidcToken ?? attachment?.oidcToken;
           console.log("[Client] Sending offer to device");
           deviceWs.send(
             JSON.stringify({
@@ -452,11 +468,12 @@ export class DeviceSignaling extends DurableObject<Env> {
                 sd: msg.data.sd,
                 ip,
                 iceServers,
-                OidcGoogle: msg.data?.oidcToken,
+                OidcGoogle: oidcGoogle,
               },
             }),
           );
           break;
+        }
 
         case "new-ice-candidate":
           console.log("[Client] Sending ICE candidate to device");

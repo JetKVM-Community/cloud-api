@@ -18,3 +18,7 @@ terraform/.terraform.tfstate.lock.info
 
 .wrangler
 terraform.auto.tfvars
+
+# Built JetKVM UI bundle (npm run build:prod in jetkvm/kvm ui/)
+dist-ui/
+*.tfstate*

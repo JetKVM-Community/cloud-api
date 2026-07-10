@@ -11,5 +11,11 @@ terraform {
       source  = "hashicorp/random"
       version = "~> 3"
     }
+    # Used to POST the Cloudflare Calls TURN key, which the cloudflare provider
+    # cannot round-trip. See turn.tf.
+    http = {
+      source  = "hashicorp/http"
+      version = "~> 3.4"
+    }
   }
 }

@@ -14,6 +14,9 @@ cloudflare_zone_id = ""
 # ── Worker ───────────────────────────────────────────────────────────────────
 worker_name = "jetkvm-cloud-api"
 
+# Your account's workers.dev subdomain, used only to render worker_subdomain_url.
+workers_dev_subdomain = ""
+
 # ── D1 ───────────────────────────────────────────────────────────────────────
 d1_database_name = "jetkvm-cloud-api"
 
@@ -33,7 +36,12 @@ r2_cdn_hostname = "releases.jetkvm.com"
 # When true, Terraform creates an Access SaaS application and Cloudflare Access
 # becomes the Worker's OIDC provider; OIDC_ISSUER, OIDC_CLIENT_ID and
 # OIDC_CLIENT_SECRET are taken from that application.
-enable_access           = true
+#
+# NOTE: device registration requires Google. The firmware hardcodes
+# https://accounts.google.com in cloud.go and rejects any other issuer with
+# 400 {"error":"Invalid OIDC token"}. Set enable_access = false and supply the
+# Google OAuth credentials below if devices must self-register.
+enable_access           = false
 access_app_name         = "JetKVM Cloud API"
 access_session_duration = "24h"
 
@@ -47,7 +55,12 @@ access_allowed_email_domains = []
 # oidc_client_secret = ""
 
 # ── Cloudflare Calls (TURN) ──────────────────────────────────────────────────
-turn_app_name = "jetkvm-cloud-api"
+# The key is minted by a POST from the http provider (see turn.tf). Set
+# create_turn_key = true for exactly ONE apply, then set it back to false;
+# the data source re-POSTs on every read and would mint a key each plan.
+turn_app_name   = "jetkvm-cloud-api"
+create_turn_key = false
+
 
 # ── Worker Environment ───────────────────────────────────────────────────────
 cors_origins       = "https://app.jetkvm.com"

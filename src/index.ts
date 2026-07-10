@@ -13,6 +13,7 @@ import * as OIDC from "./oidc";
 import * as Webrtc from "./webrtc";
 import * as Releases from "./releases";
 import { redfishRouter } from "./redfish";
+import { handleDeviceWebSocket } from "./device-ws";
 
 // Re-export the Durable Object so wrangler can discover it
 export { DeviceSignaling } from "./signaling";
@@ -52,7 +53,17 @@ app.use("*", async (c, next) => {
 // Routes
 // ---------------------------------------------------------------------------
 
-app.get("/", (c) => c.text("OK"));
+// The JetKVM firmware dials its cloud WebSocket at the root of CloudURL with no
+// path (see websocket.Dial(config.CloudURL) in the device's cloud.go), so the
+// device upgrade must be served from "/". A plain GET (health check, no Upgrade
+// header) still returns "OK".
+app.get("/", (c) => {
+  const upgradeHeader = c.req.header("Upgrade");
+  if (upgradeHeader && upgradeHeader.toLowerCase() === "websocket") {
+    return handleDeviceWebSocket(c);
+  }
+  return c.text("OK");
+});
 
 app.get("/healthz", (c) =>
   c.json({ ready: true, time: new Date().toISOString() }),
@@ -94,6 +105,8 @@ app.post("/webrtc/turn_activity", authenticated, Webrtc.CreateTurnActivity);
 
 // OIDC
 app.post("/oidc/login", OIDC.Login);
+// Legacy alias: the default UI submits a native form to /oidc/google.
+app.post("/oidc/google", OIDC.Login);
 app.get("/oidc/callback_o", OIDC.Callback);
 app.get("/oidc/callback", OIDC.CallbackIntermediate);
 
@@ -107,52 +120,7 @@ app.post("/logout", (c) => {
 // WebSocket upgrade routes (device + client signaling via Durable Object)
 // ---------------------------------------------------------------------------
 
-/**
- * Device WebSocket registration.
- * Devices connect here with Authorization header.
- * The request is upgraded and forwarded to the device's Durable Object.
- */
-app.get("/ws/device", async (c) => {
-  const upgradeHeader = c.req.header("Upgrade");
-  if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
-    return c.text("WebSocket upgrade required", 426);
-  }
-
-  const prisma = c.get("prisma");
-
-  // Authenticate device
-  const authHeader = c.req.header("Authorization");
-  const secretToken = authHeader?.split(" ")?.[1];
-  if (!secretToken) {
-    return c.text("Unauthorized", 401);
-  }
-
-  const deviceId = c.req.header("X-Device-Id");
-  if (!deviceId) {
-    return c.text("Missing device ID", 400);
-  }
-
-  const device = await prisma.device.findFirst({
-    where: { id: deviceId, secretToken },
-  });
-  if (!device) {
-    return c.text("Invalid credentials", 401);
-  }
-
-  // Forward upgrade to the Durable Object
-  const doId = c.env.DEVICE_SIGNALING.idFromName(device.id);
-  const stub = c.env.DEVICE_SIGNALING.get(doId);
-
-  const doReq = new Request("https://do/connect/device", {
-    headers: {
-      Upgrade: "websocket",
-      "CF-Connecting-IP": c.req.header("CF-Connecting-IP") || c.req.header("X-Real-IP") || "",
-      "X-App-Version": c.req.header("X-App-Version") || "",
-    },
-  });
-
-  return stub.fetch(doReq);
-});
+app.get("/ws/device", handleDeviceWebSocket);
 
 /**
  * Client WebSocket signaling.
@@ -186,12 +154,20 @@ app.get("/webrtc/signaling/client", async (c) => {
     return c.text("Device not found", 404);
   }
 
-  // Forward upgrade to the Durable Object
+  // Forward upgrade to the Durable Object. The client's OIDC ID token rides
+  // along so the DO can stamp it onto the SDP offer it relays to the device:
+  // the firmware re-verifies that token (as `OidcGoogle`) against Google on
+  // every cloud session and refuses to answer without it. The browser never
+  // sends the token in its offer — the cloud injects it from the authenticated
+  // session. See handleClientMessage in signaling.ts.
   const doId = c.env.DEVICE_SIGNALING.idFromName(deviceId);
   const stub = c.env.DEVICE_SIGNALING.get(doId);
 
   const doReq = new Request("https://do/connect/client", {
-    headers: { Upgrade: "websocket" },
+    headers: {
+      Upgrade: "websocket",
+      "X-Oidc-Token": idToken,
+    },
   });
 
   return stub.fetch(doReq);

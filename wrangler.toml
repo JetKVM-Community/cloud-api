@@ -18,14 +18,20 @@ bucket_name = "jetkvm-releases"
 
 # ---------------------------------------------------------------------------
 # Cloudflare D1 — serverless SQLite database
-# After `terraform apply`, set database_id from Terraform output:
+# database_id comes from Terraform:
 #   terraform -chdir=terraform output -raw d1_database_id
+#
+# `migrations_dir` is deliberately unset. Prisma writes each migration to
+# <name>/migration.sql, but `wrangler d1 migrations apply` only reads flat .sql
+# files, so it would silently find nothing. Apply the D1 chain explicitly:
+#   npm run d1-migrate
+# Note the 2024_* migrations are Postgres (BIGSERIAL) from before the D1 port;
+# only the 2025010100000{0,1}_* pair applies to D1.
 # ---------------------------------------------------------------------------
 [[d1_databases]]
 binding = "DB"
 database_name = "jetkvm-cloud-api"
-database_id = "your-d1-database-id"
-migrations_dir = "prisma/migrations"
+database_id = "3e7dc8be-d41b-48df-913f-dd90b7fd3a21"
 
 # ---------------------------------------------------------------------------
 # Durable Object — per-device WebSocket signaling & state
