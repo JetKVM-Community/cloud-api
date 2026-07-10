@@ -6,6 +6,9 @@
 # Resources provisioned:
 #   • D1 Database             — serverless SQLite
 #   • R2 Bucket               — firmware release storage
+#   • R2 Custom Domain        — public CDN hostname for releases (dns.tf)
+#   • Access Application      — Access as the OIDC provider (access.tf)
+#   • Calls TURN Key          — WebRTC ICE credentials (turn.tf)
 #   • Worker                  — container for the Worker script
 #   • Worker Version          — compiled Worker with all modules and bindings
 #   • Workers Deployment      — deploys the version to production
@@ -25,6 +28,59 @@ locals {
   account_id = data.cloudflare_accounts.main.result[0].id
   wasm_files = fileset(var.worker_dist_dir, "*.wasm")
   wasm_file  = one(local.wasm_files)
+
+  # The Worker builds URLs from these, so they need a scheme; the variables hold
+  # bare hostnames.
+  api_url    = var.api_hostname != "" ? "https://${var.api_hostname}" : ""
+  app_url    = var.app_hostname != "" ? "https://${var.app_hostname}" : ""
+  r2_cdn_url = var.r2_cdn_hostname != "" ? "https://${var.r2_cdn_hostname}" : ""
+
+  # Named identities if any were given, otherwise anyone who authenticates.
+  # The Worker additionally enforces ALLOWED_IDENTITIES on every request.
+  access_include = length(var.access_allowed_emails) > 0 || length(var.access_allowed_email_domains) > 0 ? concat(
+    [for email in var.access_allowed_emails : { email = { email = email } }],
+    [for domain in var.access_allowed_email_domains : { email_domain = { domain = domain } }],
+  ) : [{ everyone = {} }]
+
+  # OIDC credentials come from the Access SaaS app, or from an external IdP.
+  oidc_client_id     = var.enable_access ? one(cloudflare_zero_trust_access_application.api[*].saas_app.client_id) : var.oidc_client_id
+  oidc_client_secret = var.enable_access ? one(cloudflare_zero_trust_access_application.api[*].saas_app.client_secret) : var.oidc_client_secret
+
+  # Access serves OIDC discovery under a per-client path, and src/auth.ts appends
+  # "/.well-known/openid-configuration" to OIDC_ISSUER. The real `iss` claim is
+  # read back out of that discovery document, so this need not equal the issuer.
+  access_auth_domain = one(data.cloudflare_zero_trust_organization.main[*].auth_domain)
+  oidc_issuer = (
+    var.enable_access
+    ? "https://${local.access_auth_domain}/cdn-cgi/access/sso/oidc/${local.oidc_client_id}"
+    : var.oidc_issuer
+  )
+
+  # Empty values are omitted so the Worker's optional bindings stay undefined
+  # rather than becoming "".
+  worker_vars = merge(
+    {
+      OIDC_ISSUER        = local.oidc_issuer
+      OIDC_CLIENT_ID     = local.oidc_client_id
+      CLOUDFLARE_TURN_ID = cloudflare_calls_turn_app.webrtc.uid
+    },
+    local.api_url != "" ? { API_HOSTNAME = local.api_url } : {},
+    local.app_url != "" ? { APP_HOSTNAME = local.app_url } : {},
+    local.r2_cdn_url != "" ? { R2_CDN_URL = local.r2_cdn_url } : {},
+    var.cors_origins != "" ? { CORS_ORIGINS = var.cors_origins } : {},
+    var.allowed_identities != "" ? { ALLOWED_IDENTITIES = var.allowed_identities } : {},
+  )
+
+  worker_secrets = {
+    COOKIE_SECRET         = random_password.cookie_secret.result
+    OIDC_CLIENT_SECRET    = local.oidc_client_secret
+    CLOUDFLARE_TURN_TOKEN = cloudflare_calls_turn_app.webrtc.key
+  }
+
+  worker_env_bindings = concat(
+    [for name, text in local.worker_vars : { name = name, type = "plain_text", text = text }],
+    [for name, text in local.worker_secrets : { name = name, type = "secret_text", text = text }],
+  )
 }
 
 # -----------------------------------------------------------------------------
@@ -175,32 +231,30 @@ resource "cloudflare_worker_version" "api" {
 
   # ── Resource bindings ──────────────────────────────────────────────────────
 
-  bindings = [
-    # D1 Database
-    {
-      name = "DB"
-      type = "d1"
-      id   = cloudflare_d1_database.api.id
-    },
-    # R2 Bucket
-    {
-      name        = "R2_BUCKET"
-      type        = "r2_bucket"
-      bucket_name = cloudflare_r2_bucket.releases.name
-    },
-    # Durable Object — DeviceSignaling (defined in the same script)
-    {
-      name       = "DEVICE_SIGNALING"
-      type       = "durable_object_namespace"
-      class_name = "DeviceSignaling"
-    },
-    # Session cookie signing key (auto-generated)
-    {
-      name = "COOKIE_SECRET"
-      type = "secret_text"
-      text = random_password.cookie_secret.result
-    },
-  ]
+  bindings = concat(
+    [
+      # D1 Database
+      {
+        name = "DB"
+        type = "d1"
+        id   = cloudflare_d1_database.api.id
+      },
+      # R2 Bucket
+      {
+        name        = "R2_BUCKET"
+        type        = "r2_bucket"
+        bucket_name = cloudflare_r2_bucket.releases.name
+      },
+      # Durable Object — DeviceSignaling (defined in the same script)
+      {
+        name       = "DEVICE_SIGNALING"
+        type       = "durable_object_namespace"
+        class_name = "DeviceSignaling"
+      },
+    ],
+    # OIDC, TURN, hostnames and the cookie secret — see locals in this file.
+    local.worker_env_bindings,
+  )
 
   depends_on = [cloudflare_workers_deployment.bootstrap]
 }

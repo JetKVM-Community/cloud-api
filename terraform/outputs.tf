@@ -36,3 +36,53 @@ output "worker_version_id" {
   description = "ID of the deployed Worker version."
   value       = cloudflare_worker_version.api.id
 }
+
+# -----------------------------------------------------------------------------
+# Zero Trust Access
+# -----------------------------------------------------------------------------
+
+output "access_application_id" {
+  description = "ID of the Access SaaS application, or null when enable_access = false."
+  value       = one(cloudflare_zero_trust_access_application.api[*].id)
+}
+
+output "access_auth_domain" {
+  description = "Zero Trust auth domain, e.g. acme.cloudflareaccess.com."
+  value       = local.access_auth_domain
+}
+
+output "oidc_issuer" {
+  description = "OIDC issuer/discovery base handed to the Worker."
+  value       = local.oidc_issuer
+}
+
+output "oidc_client_id" {
+  description = "OIDC client ID handed to the Worker."
+  value       = local.oidc_client_id
+}
+
+output "oidc_client_secret" {
+  description = "OIDC client secret handed to the Worker. Cloudflare returns this only on creation."
+  value       = local.oidc_client_secret
+  sensitive   = true
+}
+
+# -----------------------------------------------------------------------------
+# TURN / R2 CDN
+# -----------------------------------------------------------------------------
+
+output "turn_key_id" {
+  description = "Cloudflare Calls TURN key ID (CLOUDFLARE_TURN_ID)."
+  value       = cloudflare_calls_turn_app.webrtc.uid
+}
+
+output "turn_key_token" {
+  description = "Cloudflare Calls TURN bearer token (CLOUDFLARE_TURN_TOKEN)."
+  value       = cloudflare_calls_turn_app.webrtc.key
+  sensitive   = true
+}
+
+output "r2_cdn_url" {
+  description = "Public URL prefix serving R2 release artifacts, or \"\" when no custom domain is configured."
+  value       = local.r2_cdn_url
+}

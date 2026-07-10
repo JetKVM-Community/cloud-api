@@ -1,11 +1,15 @@
 # =============================================================================
 # Example Terraform variable values — copy to terraform.tfvars and fill in.
 # DO NOT commit terraform.tfvars (it contains secrets).
+#
+# The OIDC client credentials, the TURN key and the session cookie secret are
+# created by Terraform and read back off the resources, so they are not set here.
 # =============================================================================
 
-cloudflare_api_token  = ""
-cloudflare_account_id = ""
-cloudflare_zone_id    = ""
+cloudflare_api_token = ""
+
+# Zone hosting r2_cdn_hostname. Only needed when r2_cdn_hostname is set.
+cloudflare_zone_id = ""
 
 # ── Worker ───────────────────────────────────────────────────────────────────
 worker_name = "jetkvm-cloud-api"
@@ -17,33 +21,37 @@ d1_database_name = "jetkvm-cloud-api"
 r2_bucket_name     = "jetkvm-releases"
 r2_bucket_location = "wnam"
 
-# ── Custom Domain (leave empty to skip) ──────────────────────────────────────
+# ── Hostnames (bare, no scheme; leave empty to skip) ─────────────────────────
 api_hostname = "api.jetkvm.com"
 app_hostname = "app.jetkvm.com"
 
-# ── R2 CDN DNS (leave empty to skip) ─────────────────────────────────────────
-r2_cdn_hostname     = "releases.jetkvm.com"
-r2_cdn_cname_target = ""
+# R2 custom domain for firmware releases; empty disables it.
+# The Worker's R2_CDN_URL is derived as https://<r2_cdn_hostname>.
+r2_cdn_hostname = "releases.jetkvm.com"
 
 # ── Zero Trust Access ────────────────────────────────────────────────────────
-enable_access          = false
-access_idp_name        = "JetKVM OIDC"
+# When true, Terraform creates an Access SaaS application and Cloudflare Access
+# becomes the Worker's OIDC provider; OIDC_ISSUER, OIDC_CLIENT_ID and
+# OIDC_CLIENT_SECRET are taken from that application.
+enable_access           = true
+access_app_name         = "JetKVM Cloud API"
 access_session_duration = "24h"
 
-# ── OIDC (required when enable_access = true) ────────────────────────────────
-oidc_issuer        = "https://your-team.cloudflareaccess.com"
-oidc_client_id     = ""
-oidc_client_secret = ""
+# Who may log in through Access. Both empty = anyone who authenticates.
+access_allowed_emails        = []
+access_allowed_email_domains = []
 
-# ── Worker Secrets ────────────────────────────────────────────────────────────
-cookie_secret         = ""
-cloudflare_turn_id    = ""
-cloudflare_turn_token = ""
+# ── External OIDC (only when enable_access = false) ───────────────────────────
+# oidc_issuer        = "https://accounts.example.com"
+# oidc_client_id     = ""
+# oidc_client_secret = ""
+
+# ── Cloudflare Calls (TURN) ──────────────────────────────────────────────────
+turn_app_name = "jetkvm-cloud-api"
 
 # ── Worker Environment ───────────────────────────────────────────────────────
-r2_cdn_url          = "https://releases.jetkvm.com"
-cors_origins        = "https://app.jetkvm.com"
-allowed_identities  = ""
+cors_origins       = "https://app.jetkvm.com"
+allowed_identities = ""
 
 # ── Worker Build / Deploy ────────────────────────────────────────────────────
 worker_dist_dir        = "../dist"
